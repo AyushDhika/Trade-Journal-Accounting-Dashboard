@@ -33,7 +33,8 @@ CREATE TABLE IF NOT EXISTS trades (
     tax                 REAL DEFAULT 0,
     commission          REAL DEFAULT 0,
     swap                REAL DEFAULT 0,
-    pnl                 REAL NOT NULL DEFAULT 0,   -- net P/L
+    pnl                 REAL NOT NULL DEFAULT 0,   -- NET P/L (after fee/tax/commission/swap)
+    gross_pnl           REAL,                       -- P/L before costs (as reported by broker, if known)
     points              REAL,
     strategy             TEXT,
     remarks             TEXT,
@@ -59,6 +60,11 @@ def get_conn():
 def init_db():
     with get_conn() as conn:
         conn.executescript(SCHEMA)
+        # Migration: add gross_pnl to dbs created before this column existed
+        cols = {row["name"] for row in conn.execute("PRAGMA table_info(trades)")}
+        if "gross_pnl" not in cols:
+            conn.execute("ALTER TABLE trades ADD COLUMN gross_pnl REAL")
+            conn.execute("UPDATE trades SET gross_pnl = pnl WHERE gross_pnl IS NULL")
 
 
 def insert_manual_trade(trade: dict) -> int:
