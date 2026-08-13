@@ -434,15 +434,20 @@ elif page == "📅 Calendar":
                         bg, border, pnl_txt = "#141B22", "#1D242C", "<div style='color:#8B98A5;font-size:12px;'>—</div>"
                     trades_txt = f"<div style='color:#6B7885;font-size:10px;margin-top:2px;'>{trades_val} trade{'s' if trades_val != 1 else ''}</div>" if trades_val else ""
                     is_today = " box-shadow: inset 0 0 0 1.5px #3B82F6;" if d == date.today() else ""
-                    rows_html += f"""<div style="background:{bg};border:1px solid {border};border-radius:8px;min-height:74px;padding:8px;{is_today}">
-                        <div style='font-size:12px;color:#8B98A5;font-weight:600;'>{day}</div>
-                        {pnl_txt}{trades_txt}
-                    </div>"""
+                    rows_html += (
+                        f'<div style="background:{bg};border:1px solid {border};'
+                        f'border-radius:8px;min-height:74px;padding:8px;{is_today}">'
+                        f"<div style='font-size:12px;color:#8B98A5;font-weight:600;'>{day}</div>"
+                        f"{pnl_txt}{trades_txt}</div>"
+                    )
 
-            st.markdown(f"""
-                <div style="display:grid;grid-template-columns:repeat(7,1fr);gap:6px;margin-bottom:2px;">{header_html}</div>
-                <div style="display:grid;grid-template-columns:repeat(7,1fr);gap:6px;">{rows_html}</div>
-            """, unsafe_allow_html=True)
+            calendar_html = (
+                '<div style="display:grid;grid-template-columns:repeat(7,1fr);gap:6px;margin-bottom:2px;">'
+                f'{header_html}</div>'
+                '<div style="display:grid;grid-template-columns:repeat(7,1fr);gap:6px;">'
+                f'{rows_html}</div>'
+            )
+            st.markdown(calendar_html, unsafe_allow_html=True)
 
             st.markdown("<div style='height:26px'></div>", unsafe_allow_html=True)
             st.markdown('<div class="section-title">Monthly Overview (all-time)</div>', unsafe_allow_html=True)
