@@ -98,6 +98,15 @@ def parse_broker_csv(file_bytes: bytes) -> tuple[pd.DataFrame, str]:
     df["strategy"] = None
     df["tags"] = None
 
+    # The broker's "P/L" column is GROSS — fee/tax/commission/swap are reported
+    # separately (and are already signed, e.g. fee = -3 for a cost). Keep the
+    # gross figure for reference, and store the NET figure as `pnl`, which is
+    # what all analytics in this app are built on.
+    if "pnl" in df.columns:
+        df["gross_pnl"] = df["pnl"]
+        cost_cols = [c for c in ["fee", "tax", "commission", "swap"] if c in df.columns]
+        df["pnl"] = df["gross_pnl"] + df[cost_cols].sum(axis=1)
+
     if "archived" in df.columns:
         df = df.drop(columns=["archived"])
 
@@ -225,6 +234,51 @@ def pnl_by_hour(df: pd.DataFrame) -> pd.DataFrame:
     d["hour"] = pd.to_datetime(d["entry_time"]).dt.hour
     grouped = d.groupby("hour").agg(pnl=("pnl", "sum"), trades=("pnl", "count")).reset_index()
     return grouped
+
+
+def cost_breakdown(df: pd.DataFrame) -> dict:
+    """Total fees/tax/commission/swap paid, plus gross vs net P/L."""
+    if df.empty:
+        return {"fee": 0.0, "tax": 0.0, "commission": 0.0, "swap": 0.0,
+                "total_costs": 0.0, "gross_pnl": 0.0, "net_pnl": 0.0}
+    fee = df.get("fee", pd.Series(dtype=float)).abs().sum()
+    tax = df.get("tax", pd.Series(dtype=float)).abs().sum()
+    commission = df.get("commission", pd.Series(dtype=float)).abs().sum()
+    swap = df.get("swap", pd.Series(dtype=float)).sum()  # swap can be + or -, don't force abs
+    net_pnl = df["pnl"].sum()
+    gross_pnl = df["gross_pnl"].sum() if "gross_pnl" in df.columns else net_pnl
+    total_costs = fee + tax + commission + abs(min(swap, 0))
+    return {
+        "fee": float(fee), "tax": float(tax), "commission": float(commission),
+        "swap": float(swap), "total_costs": float(total_costs),
+        "gross_pnl": float(gross_pnl), "net_pnl": float(net_pnl),
+    }
+
+
+def calendar_month_data(df: pd.DataFrame, year: int, month: int) -> pd.DataFrame:
+    """Daily P/L + trade count for every day in a given month (df must have exit_time)."""
+    if df.empty:
+        return pd.DataFrame(columns=["date", "pnl", "trades"])
+    d = df.copy()
+    d["exit_dt"] = pd.to_datetime(d["exit_time"], errors="coerce")
+    mask = (d["exit_dt"].dt.year == year) & (d["exit_dt"].dt.month == month)
+    d = d[mask]
+    if d.empty:
+        return pd.DataFrame(columns=["date", "pnl", "trades"])
+    d["date"] = d["exit_dt"].dt.date
+    grouped = d.groupby("date").agg(pnl=("pnl", "sum"), trades=("pnl", "count")).reset_index()
+    return grouped
+
+
+def monthly_summary(df: pd.DataFrame) -> pd.DataFrame:
+    """P/L aggregated by calendar month, across all history — for a year-over-year overview."""
+    if df.empty:
+        return pd.DataFrame(columns=["month", "pnl", "trades"])
+    d = df.copy()
+    d["exit_dt"] = pd.to_datetime(d["exit_time"], errors="coerce")
+    d["month"] = d["exit_dt"].dt.to_period("M").astype(str)
+    grouped = d.groupby("month").agg(pnl=("pnl", "sum"), trades=("pnl", "count")).reset_index()
+    return grouped.sort_values("month")
 
 
 def format_currency(value: float, symbol: str = "\u20b9") -> str:
