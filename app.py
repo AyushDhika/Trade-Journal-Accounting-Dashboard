@@ -174,7 +174,7 @@ with st.sidebar:
 
     page = st.radio(
         "Navigate",
-        ["📊 Dashboard", "➕ Add Trade", "📥 Import CSV", "📜 Trade History", "🔍 Analytics", "⚙️ Settings"],
+        ["📊 Dashboard", "📅 Calendar", "➕ Add Trade", "📥 Import CSV", "📜 Trade History", "🔍 Analytics", "⚙️ Settings"],
         label_visibility="collapsed",
     )
 
@@ -189,6 +189,7 @@ with st.sidebar:
 # ---------------------------------------------------------------------------
 PAGE_TITLES = {
     "📊 Dashboard": ("Performance Dashboard", "Overview of your trading performance across all logged trades"),
+    "📅 Calendar": ("Trading Calendar", "Daily P/L at a glance — navigate month to month or pick a date range"),
     "➕ Add Trade": ("Add Trade", "Manually log a closed trade"),
     "📥 Import CSV": ("Import Broker CSV", "Upload your broker's Closed Trades Report to sync trades automatically"),
     "📜 Trade History": ("Trade History", "Browse, filter, edit and export every logged trade"),
@@ -287,6 +288,26 @@ if page == "📊 Dashboard":
             kpi_card("Current Streak", streak_txt, positive=(streak >= 0))
 
         st.markdown("<div style='height:22px'></div>", unsafe_allow_html=True)
+        st.markdown('<div class="section-title">Costs Breakdown</div>', unsafe_allow_html=True)
+        costs = utils.cost_breakdown(filtered)
+        cc1, cc2, cc3, cc4, cc5 = st.columns(5)
+        with cc1:
+            kpi_card("Gross P/L", utils.format_currency(costs["gross_pnl"], CURRENCY_SYMBOL),
+                      sub="Before costs", positive=(costs["gross_pnl"] >= 0))
+        with cc2:
+            kpi_card("Total Fees", utils.format_currency(costs["fee"], CURRENCY_SYMBOL), positive=False)
+        with cc3:
+            kpi_card("Commission", utils.format_currency(costs["commission"], CURRENCY_SYMBOL), positive=False)
+        with cc4:
+            kpi_card("Tax", utils.format_currency(costs["tax"], CURRENCY_SYMBOL), positive=False)
+        with cc5:
+            kpi_card("Net P/L", utils.format_currency(costs["net_pnl"], CURRENCY_SYMBOL),
+                      sub="After all costs", positive=(costs["net_pnl"] >= 0))
+        cost_pct = (costs["total_costs"] / abs(costs["gross_pnl"]) * 100) if costs["gross_pnl"] else 0
+        st.caption(f"Total costs paid: **{utils.format_currency(costs['total_costs'], CURRENCY_SYMBOL)}** "
+                    f"({cost_pct:.1f}% of gross P/L)" + (f" · Swap/overnight interest: {utils.format_currency(costs['swap'], CURRENCY_SYMBOL)}" if costs["swap"] else ""))
+
+        st.markdown("<div style='height:22px'></div>", unsafe_allow_html=True)
         st.markdown('<div class="section-title">Equity Curve</div>', unsafe_allow_html=True)
         eq = utils.equity_curve(filtered)
         fig = go.Figure()
@@ -333,6 +354,137 @@ if page == "📊 Dashboard":
 
 
 # ---------------------------------------------------------------------------
+# PAGE: Calendar
+# ---------------------------------------------------------------------------
+elif page == "📅 Calendar":
+    all_df = db.fetch_trades()
+
+    if all_df.empty:
+        st.info("No trades logged yet.")
+    else:
+        all_df["exit_dt"] = pd.to_datetime(all_df["exit_time"], errors="coerce")
+        min_dt = all_df["exit_dt"].min()
+        max_dt = all_df["exit_dt"].max()
+
+        view_mode = st.radio("View", ["Month grid", "Custom date range"], horizontal=True, label_visibility="collapsed")
+
+        if view_mode == "Month grid":
+            if "cal_year" not in st.session_state:
+                st.session_state.cal_year = max_dt.year
+                st.session_state.cal_month = max_dt.month
+
+            nav1, nav2, nav3 = st.columns([1, 3, 1])
+            with nav1:
+                if st.button("← Prev", use_container_width=True):
+                    m, y = st.session_state.cal_month - 1, st.session_state.cal_year
+                    if m == 0:
+                        m, y = 12, y - 1
+                    st.session_state.cal_month, st.session_state.cal_year = m, y
+            with nav3:
+                if st.button("Next →", use_container_width=True):
+                    m, y = st.session_state.cal_month + 1, st.session_state.cal_year
+                    if m == 13:
+                        m, y = 1, y + 1
+                    st.session_state.cal_month, st.session_state.cal_year = m, y
+
+            year, month = st.session_state.cal_year, st.session_state.cal_month
+            with nav2:
+                st.markdown(f"<h3 style='text-align:center;margin:0;'>{date(year, month, 1).strftime('%B %Y')}</h3>", unsafe_allow_html=True)
+
+            cal_data = utils.calendar_month_data(all_df, year, month)
+            pnl_by_day = {row["date"]: (row["pnl"], row["trades"]) for _, row in cal_data.iterrows()}
+
+            month_pnl = cal_data["pnl"].sum() if not cal_data.empty else 0.0
+            month_trades = int(cal_data["trades"].sum()) if not cal_data.empty else 0
+            trading_days = len(cal_data)
+            green_days = int((cal_data["pnl"] > 0).sum()) if not cal_data.empty else 0
+
+            s1, s2, s3, s4 = st.columns(4)
+            s1.metric("Month P/L", utils.format_currency(month_pnl, CURRENCY_SYMBOL))
+            s2.metric("Trades", month_trades)
+            s3.metric("Trading Days", trading_days)
+            s4.metric("Green Days", f"{green_days}/{trading_days}" if trading_days else "0/0")
+
+            st.markdown("<div style='height:10px'></div>", unsafe_allow_html=True)
+
+            import calendar as cal_module
+            cal_module.setfirstweekday(cal_module.MONDAY)
+            month_matrix = cal_module.monthcalendar(year, month)
+
+            weekday_labels = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+            header_html = "".join(f"<div style='text-align:center;font-size:11px;font-weight:600;color:#6B7885;padding:4px;'>{w}</div>" for w in weekday_labels)
+
+            rows_html = ""
+            for week in month_matrix:
+                for day in week:
+                    if day == 0:
+                        rows_html += "<div style='background:transparent;border-radius:8px;min-height:74px;'></div>"
+                        continue
+                    d = date(year, month, day)
+                    pnl_val, trades_val = pnl_by_day.get(d, (None, 0))
+                    if pnl_val is None:
+                        bg, border, pnl_txt = "#141B22", "#1D242C", ""
+                    elif pnl_val > 0:
+                        bg, border = "rgba(34,197,94,0.14)", "rgba(34,197,94,0.4)"
+                        pnl_txt = f"<div style='color:#22C55E;font-family:JetBrains Mono,monospace;font-size:12px;font-weight:700;'>+{utils.format_currency(pnl_val, CURRENCY_SYMBOL)}</div>"
+                    elif pnl_val < 0:
+                        bg, border = "rgba(239,68,68,0.14)", "rgba(239,68,68,0.4)"
+                        pnl_txt = f"<div style='color:#EF4444;font-family:JetBrains Mono,monospace;font-size:12px;font-weight:700;'>{utils.format_currency(pnl_val, CURRENCY_SYMBOL)}</div>"
+                    else:
+                        bg, border, pnl_txt = "#141B22", "#1D242C", "<div style='color:#8B98A5;font-size:12px;'>—</div>"
+                    trades_txt = f"<div style='color:#6B7885;font-size:10px;margin-top:2px;'>{trades_val} trade{'s' if trades_val != 1 else ''}</div>" if trades_val else ""
+                    is_today = " box-shadow: inset 0 0 0 1.5px #3B82F6;" if d == date.today() else ""
+                    rows_html += f"""<div style="background:{bg};border:1px solid {border};border-radius:8px;min-height:74px;padding:8px;{is_today}">
+                        <div style='font-size:12px;color:#8B98A5;font-weight:600;'>{day}</div>
+                        {pnl_txt}{trades_txt}
+                    </div>"""
+
+            st.markdown(f"""
+                <div style="display:grid;grid-template-columns:repeat(7,1fr);gap:6px;margin-bottom:2px;">{header_html}</div>
+                <div style="display:grid;grid-template-columns:repeat(7,1fr);gap:6px;">{rows_html}</div>
+            """, unsafe_allow_html=True)
+
+            st.markdown("<div style='height:26px'></div>", unsafe_allow_html=True)
+            st.markdown('<div class="section-title">Monthly Overview (all-time)</div>', unsafe_allow_html=True)
+            msum = utils.monthly_summary(all_df)
+            colors = [GREEN if v >= 0 else RED for v in msum["pnl"]]
+            fig = go.Figure(go.Bar(x=msum["month"], y=msum["pnl"], marker_color=colors,
+                                    hovertemplate="%{x}<br>P/L: " + CURRENCY_SYMBOL + "%{y:,.2f}<extra></extra>"))
+            fig.update_layout(template=PLOTLY_TEMPLATE, height=280)
+            st.plotly_chart(fig, use_container_width=True)
+
+        else:
+            c1, c2 = st.columns(2)
+            with c1:
+                start_d = st.date_input("From", value=min_dt.date(), min_value=min_dt.date(), max_value=max_dt.date())
+            with c2:
+                end_d = st.date_input("To", value=max_dt.date(), min_value=min_dt.date(), max_value=max_dt.date())
+
+            mask = (all_df["exit_dt"].dt.date >= start_d) & (all_df["exit_dt"].dt.date <= end_d)
+            ranged = all_df[mask]
+
+            k = utils.compute_kpis(ranged)
+            costs = utils.cost_breakdown(ranged)
+            r1, r2, r3, r4 = st.columns(4)
+            r1.metric("Net P/L", utils.format_currency(k["total_pnl"], CURRENCY_SYMBOL))
+            r2.metric("Trades", k["total_trades"])
+            r3.metric("Win Rate", f"{k['win_rate']:.1f}%")
+            r4.metric("Total Costs", utils.format_currency(costs["total_costs"], CURRENCY_SYMBOL))
+
+            dpnl = utils.daily_pnl(ranged)
+            colors = [GREEN if v >= 0 else RED for v in dpnl["pnl"]]
+            fig = go.Figure(go.Bar(x=dpnl["date"].astype(str), y=dpnl["pnl"], marker_color=colors,
+                                    hovertemplate="%{x}<br>P/L: " + CURRENCY_SYMBOL + "%{y:,.2f}<extra></extra>"))
+            fig.update_layout(template=PLOTLY_TEMPLATE, height=340, title="P/L by Day")
+            st.plotly_chart(fig, use_container_width=True)
+
+            st.dataframe(
+                dpnl.rename(columns={"date": "Date", "pnl": "P/L", "trades": "Trades"}),
+                use_container_width=True, hide_index=True,
+            )
+
+
+# ---------------------------------------------------------------------------
 # PAGE: Add Trade
 # ---------------------------------------------------------------------------
 elif page == "➕ Add Trade":
@@ -375,13 +527,13 @@ elif page == "➕ Add Trade":
                 st.error("Instrument is required.")
             else:
                 if manual_pnl != 0:
-                    pnl = manual_pnl
+                    gross_pnl = manual_pnl
                 elif entry_price and exit_price:
                     direction = 1 if side == "Buy" else -1
-                    pnl = (exit_price - entry_price) * lot_size * direction
+                    gross_pnl = (exit_price - entry_price) * lot_size * direction
                 else:
-                    pnl = 0.0
-                pnl -= (abs(fee) + abs(tax) + abs(commission))
+                    gross_pnl = 0.0
+                pnl = gross_pnl - (abs(fee) + abs(tax) + abs(commission))
 
                 entry_dt = datetime.combine(entry_date, entry_time_val)
                 exit_dt = datetime.combine(exit_date, exit_time_val)
@@ -399,6 +551,7 @@ elif page == "➕ Add Trade":
                     "commission": commission,
                     "swap": 0.0,
                     "pnl": round(pnl, 2),
+                    "gross_pnl": round(gross_pnl, 2),
                     "points": (exit_price - entry_price) if (entry_price and exit_price) else None,
                     "strategy": strategy.strip() or None,
                     "remarks": remarks.strip() or None,
