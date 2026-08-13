@@ -66,6 +66,21 @@ def init_db():
             conn.execute("ALTER TABLE trades ADD COLUMN gross_pnl REAL")
             conn.execute("UPDATE trades SET gross_pnl = pnl WHERE gross_pnl IS NULL")
 
+        # Correction: earlier versions of the CSV importer stored the broker's
+        # GROSS P/L directly in `pnl` without subtracting fee/tax/commission/swap,
+        # so gross_pnl and pnl ended up identical for rows imported back then.
+        # This recompute is idempotent (safe to run on every boot) and only
+        # touches broker-imported rows, never manual entries.
+        conn.execute("""
+            UPDATE trades
+            SET pnl = ROUND(
+                COALESCE(gross_pnl, pnl)
+                + COALESCE(fee, 0) + COALESCE(tax, 0)
+                + COALESCE(commission, 0) + COALESCE(swap, 0),
+            2)
+            WHERE source = 'csv'
+        """)
+
 
 def insert_manual_trade(trade: dict) -> int:
     """Insert a single manually-entered trade. Returns new row id."""
