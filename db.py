@@ -43,6 +43,11 @@ CREATE TABLE IF NOT EXISTS trades (
 );
 CREATE INDEX IF NOT EXISTS idx_trades_exit_time ON trades(exit_time);
 CREATE INDEX IF NOT EXISTS idx_trades_instrument ON trades(instrument);
+
+CREATE TABLE IF NOT EXISTS settings (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
 """
 
 
@@ -80,6 +85,16 @@ def init_db():
             2)
             WHERE source = 'csv'
         """)
+
+        # Set default settings if they don't exist
+        defaults = [
+            ("leverage", "200"),
+            ("contract_size_XAUUSD", "100"),
+        ]
+        for key, val in defaults:
+            cur = conn.execute("SELECT value FROM settings WHERE key = ?", (key,))
+            if cur.fetchone() is None:
+                conn.execute("INSERT INTO settings (key, value) VALUES (?, ?)", (key, val))
 
 
 def insert_manual_trade(trade: dict) -> int:
@@ -183,3 +198,49 @@ def trade_count() -> int:
 def wipe_all():
     with get_conn() as conn:
         conn.execute("DELETE FROM trades")
+        conn.execute("DELETE FROM settings")
+
+
+# ---------- Settings helpers ----------
+def get_setting(key: str, default: str = None) -> str:
+    with get_conn() as conn:
+        cur = conn.execute("SELECT value FROM settings WHERE key = ?", (key,))
+        row = cur.fetchone()
+        if row is None:
+            return default
+        return row["value"]
+
+
+def set_setting(key: str, value: str):
+    with get_conn() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
+            (key, value)
+        )
+
+
+def get_leverage() -> float:
+    val = get_setting("leverage", "200")
+    try:
+        return float(val)
+    except ValueError:
+        return 200.0
+
+
+def get_contract_size(instrument: str) -> float:
+    key = f"contract_size_{instrument.upper()}"
+    val = get_setting(key, None)
+    if val is None:
+        # default: XAUUSD -> 100, else 1
+        if instrument.upper() == "XAUUSD":
+            return 100.0
+        return 1.0
+    try:
+        return float(val)
+    except ValueError:
+        return 1.0
+
+
+def set_contract_size(instrument: str, size: float):
+    key = f"contract_size_{instrument.upper()}"
+    set_setting(key, str(size))
