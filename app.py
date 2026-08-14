@@ -30,98 +30,265 @@ st.set_page_config(
 
 db.init_db()
 
-CURRENCY_SYMBOL = "\u20b9"  # INR
+CURRENCY_SYMBOL = "$"  # USD
 
 # ---------------------------------------------------------------------------
-# Global CSS — professional trading-terminal look
+# Global CSS — professional trading-terminal look, Apple-grade motion & depth
 # ---------------------------------------------------------------------------
 st.markdown("""
 <style>
-    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;700&display=swap');
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&family=JetBrains+Mono:wght@400;500;600;700&display=swap');
 
-    html, body, [class*="css"]  { font-family: 'Inter', sans-serif; }
+    :root {
+        --ease: cubic-bezier(0.16, 1, 0.3, 1);
+        --ease-soft: cubic-bezier(0.4, 0, 0.2, 1);
+        --bg: #0A0D12;
+        --card: #141B22;
+        --card-2: #10151B;
+        --border: #232B33;
+        --text: #E6EDF3;
+        --text-dim: #8B98A5;
+        --text-faint: #6B7885;
+        --green: #22C55E;
+        --red: #EF4444;
+        --blue: #3B82F6;
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+        *, *::before, *::after { animation-duration: 0.001ms !important; transition-duration: 0.001ms !important; }
+    }
+
+    html, body, [class*="css"]  {
+        font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+        -webkit-font-smoothing: antialiased;
+        -moz-osx-font-smoothing: grayscale;
+    }
 
     #MainMenu {visibility: hidden;}
     footer {visibility: hidden;}
     header {visibility: hidden;}
 
-    .block-container { padding-top: 1.6rem; padding-bottom: 3rem; max-width: 1400px; }
+    html { scroll-behavior: smooth; }
+
+    /* Ambient background glow — fixed, subtle, non-interactive depth */
+    .stApp {
+        background:
+            radial-gradient(1100px 520px at 8% -8%, rgba(34,197,94,0.055), transparent 60%),
+            radial-gradient(900px 480px at 96% 6%, rgba(59,130,246,0.05), transparent 55%),
+            radial-gradient(800px 500px at 50% 105%, rgba(239,68,68,0.03), transparent 60%),
+            var(--bg);
+    }
+
+    ::-webkit-scrollbar { width: 10px; height: 10px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: #232B33; border-radius: 20px; border: 2px solid var(--bg); }
+    ::-webkit-scrollbar-thumb:hover { background: #2D3742; }
+
+    .block-container {
+        padding-top: 1.8rem;
+        padding-bottom: 3rem;
+        max-width: 1400px;
+        animation: pageIn 0.5s var(--ease) both;
+    }
+
+    @keyframes pageIn {
+        from { opacity: 0; transform: translateY(6px); }
+        to   { opacity: 1; transform: translateY(0); }
+    }
+    @keyframes fadeInUp {
+        from { opacity: 0; transform: translateY(14px); }
+        to   { opacity: 1; transform: translateY(0); }
+    }
+    @keyframes fadeIn {
+        from { opacity: 0; }
+        to   { opacity: 1; }
+    }
 
     /* KPI cards */
     .kpi-card {
-        background: linear-gradient(155deg, #141B22 0%, #10151B 100%);
-        border: 1px solid #232B33;
-        border-radius: 14px;
+        background: linear-gradient(155deg, var(--card) 0%, var(--card-2) 100%);
+        border: 1px solid var(--border);
+        border-radius: 16px;
         padding: 18px 20px;
         height: 100%;
+        animation: fadeInUp 0.55s var(--ease) both;
+        transition: transform 0.35s var(--ease), box-shadow 0.35s var(--ease), border-color 0.35s var(--ease);
+        will-change: transform;
+    }
+    .kpi-card:hover {
+        transform: translateY(-4px);
+        border-color: #2E3946;
+        box-shadow: 0 16px 40px -12px rgba(0,0,0,0.55), 0 0 0 1px rgba(255,255,255,0.02);
     }
     .kpi-label {
-        font-size: 12px;
+        font-size: 11.5px;
         font-weight: 600;
-        letter-spacing: 0.06em;
+        letter-spacing: 0.07em;
         text-transform: uppercase;
-        color: #8B98A5;
-        margin-bottom: 6px;
+        color: var(--text-dim);
+        margin-bottom: 7px;
     }
     .kpi-value {
         font-family: 'JetBrains Mono', monospace;
-        font-size: 26px;
+        font-variant-numeric: tabular-nums;
+        font-size: 27px;
         font-weight: 700;
-        color: #E6EDF3;
+        color: var(--text);
         line-height: 1.2;
+        letter-spacing: -0.01em;
+        transition: color 0.35s var(--ease-soft);
     }
     .kpi-sub {
         font-size: 12px;
-        color: #6B7885;
-        margin-top: 4px;
+        color: var(--text-faint);
+        margin-top: 5px;
     }
-    .kpi-positive { color: #22C55E !important; }
-    .kpi-negative { color: #EF4444 !important; }
+    .kpi-positive { color: var(--green) !important; }
+    .kpi-negative { color: var(--red) !important; }
 
     .section-title {
         font-size: 18px;
         font-weight: 700;
-        color: #E6EDF3;
+        color: var(--text);
         margin: 6px 0 14px 0;
         padding-left: 10px;
-        border-left: 3px solid #22C55E;
+        border-left: 3px solid var(--green);
+        animation: fadeIn 0.5s var(--ease) both;
+        letter-spacing: -0.01em;
     }
 
     .app-header {
         display: flex;
         align-items: center;
         justify-content: space-between;
-        padding-bottom: 6px;
-        margin-bottom: 18px;
-        border-bottom: 1px solid #232B33;
+        padding-bottom: 10px;
+        margin-bottom: 20px;
+        border-bottom: 1px solid var(--border);
+        animation: fadeInUp 0.55s var(--ease) both;
     }
-    .app-title { font-size: 26px; font-weight: 800; color: #E6EDF3; }
-    .app-subtitle { font-size: 13px; color: #8B98A5; margin-top: -2px; }
+    .app-title {
+        font-size: 30px;
+        font-weight: 800;
+        color: var(--text);
+        letter-spacing: -0.025em;
+    }
+    .app-subtitle { font-size: 13.5px; color: var(--text-dim); margin-top: 2px; }
 
+    /* Tabs */
     .stTabs [data-baseweb="tab-list"] { gap: 4px; }
     .stTabs [data-baseweb="tab"] {
-        background-color: #141B22;
-        border-radius: 8px 8px 0 0;
-        padding: 8px 18px;
-        color: #8B98A5;
+        background-color: var(--card);
+        border-radius: 10px 10px 0 0;
+        padding: 9px 18px;
+        color: var(--text-dim);
+        transition: all 0.3s var(--ease-soft);
     }
+    .stTabs [data-baseweb="tab"]:hover { color: var(--text); background-color: #1A222B; }
     .stTabs [aria-selected="true"] {
         background-color: #1B232B;
-        color: #22C55E !important;
+        color: var(--green) !important;
         font-weight: 600;
     }
+    .stTabs [data-baseweb="tab-highlight"] { background-color: var(--green); transition: all 0.3s var(--ease); }
 
     div[data-testid="stMetric"] {
-        background: #141B22;
-        border: 1px solid #232B33;
-        border-radius: 12px;
+        background: var(--card);
+        border: 1px solid var(--border);
+        border-radius: 14px;
         padding: 14px 16px;
+        transition: transform 0.3s var(--ease), box-shadow 0.3s var(--ease);
+    }
+    div[data-testid="stMetric"]:hover { transform: translateY(-2px); box-shadow: 0 10px 28px -10px rgba(0,0,0,0.5); }
+    div[data-testid="stMetricValue"] { font-variant-numeric: tabular-nums; }
+
+    .badge-buy { background:#0F2A1B; color:var(--green); padding:3px 10px; border-radius:20px; font-size:12px; font-weight:600; transition: transform 0.2s var(--ease); }
+    .badge-sell { background:#2A0F13; color:var(--red); padding:3px 10px; border-radius:20px; font-size:12px; font-weight:600; transition: transform 0.2s var(--ease); }
+    .badge-buy:hover, .badge-sell:hover { transform: scale(1.05); }
+
+    /* Sidebar — glassy depth */
+    section[data-testid="stSidebar"] {
+        background-color: rgba(13,18,24,0.85);
+        backdrop-filter: blur(20px);
+        -webkit-backdrop-filter: blur(20px);
+        border-right: 1px solid #1D242C;
+    }
+    section[data-testid="stSidebar"] div[data-testid="stRadio"] label {
+        border-radius: 10px;
+        padding: 9px 12px !important;
+        margin-bottom: 2px;
+        transition: background-color 0.25s var(--ease-soft), transform 0.25s var(--ease-soft), color 0.25s var(--ease-soft);
+    }
+    section[data-testid="stSidebar"] div[data-testid="stRadio"] label:hover {
+        background-color: rgba(34,197,94,0.07);
+        transform: translateX(3px);
+    }
+    section[data-testid="stSidebar"] div[data-testid="stRadio"] label[data-checked="true"],
+    section[data-testid="stSidebar"] div[data-testid="stRadio"] label:has(input:checked) {
+        background-color: rgba(34,197,94,0.1);
+        border-left: 2.5px solid var(--green);
     }
 
-    .badge-buy { background:#0F2A1B; color:#22C55E; padding:3px 10px; border-radius:20px; font-size:12px; font-weight:600; }
-    .badge-sell { background:#2A0F13; color:#EF4444; padding:3px 10px; border-radius:20px; font-size:12px; font-weight:600; }
+    /* Buttons — tactile press feedback */
+    .stButton > button, .stDownloadButton > button, .stFormSubmitButton > button {
+        border-radius: 10px !important;
+        transition: transform 0.18s var(--ease-soft), box-shadow 0.25s var(--ease-soft), border-color 0.25s var(--ease-soft), background-color 0.25s var(--ease-soft) !important;
+        font-weight: 600 !important;
+    }
+    .stButton > button:hover, .stDownloadButton > button:hover, .stFormSubmitButton > button:hover {
+        transform: translateY(-1px);
+        box-shadow: 0 8px 20px -8px rgba(0,0,0,0.5);
+        border-color: #2E3946 !important;
+    }
+    .stButton > button:active, .stDownloadButton > button:active, .stFormSubmitButton > button:active {
+        transform: translateY(0) scale(0.97);
+    }
+    .stButton > button[kind="primary"], .stFormSubmitButton > button[kind="primary"] {
+        background: linear-gradient(155deg, #22C55E, #16A34A) !important;
+        border: none !important;
+    }
+    .stButton > button[kind="primary"]:hover, .stFormSubmitButton > button[kind="primary"]:hover {
+        box-shadow: 0 10px 26px -8px rgba(34,197,94,0.45);
+    }
 
-    section[data-testid="stSidebar"] { background-color: #0D1218; border-right: 1px solid #1D242C; }
+    /* Inputs — smooth focus rings */
+    .stTextInput input, .stNumberInput input, .stDateInput input, .stTextArea textarea,
+    div[data-baseweb="select"] > div {
+        border-radius: 10px !important;
+        transition: border-color 0.25s var(--ease-soft), box-shadow 0.25s var(--ease-soft) !important;
+    }
+    .stTextInput input:focus, .stNumberInput input:focus, .stDateInput input:focus, .stTextArea textarea:focus {
+        border-color: var(--green) !important;
+        box-shadow: 0 0 0 3px rgba(34,197,94,0.15) !important;
+    }
+
+    /* Expanders */
+    div[data-testid="stExpander"] {
+        border-radius: 12px !important;
+        border-color: var(--border) !important;
+        transition: border-color 0.3s var(--ease-soft);
+        overflow: hidden;
+    }
+    div[data-testid="stExpander"] details[open] summary ~ div { animation: fadeIn 0.35s var(--ease) both; }
+    div[data-testid="stExpander"]:hover { border-color: #2E3946 !important; }
+
+    /* Dataframes */
+    div[data-testid="stDataFrame"], div[data-testid="stDataEditor"] {
+        border-radius: 12px;
+        overflow: hidden;
+        animation: fadeIn 0.5s var(--ease) both;
+    }
+
+    /* Plotly charts — gentle reveal */
+    div[data-testid="stPlotlyChart"] {
+        animation: fadeInUp 0.6s var(--ease) both;
+        border-radius: 12px;
+        overflow: hidden;
+    }
+
+    /* Radio (side/view toggles outside sidebar) */
+    div[data-testid="stRadio"] > div { gap: 4px; }
+
+    hr { border-color: #1D242C !important; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -134,11 +301,14 @@ PLOTLY_TEMPLATE = go.layout.Template(
         yaxis=dict(gridcolor="#1D242C", zerolinecolor="#1D242C"),
         legend=dict(bgcolor="rgba(0,0,0,0)"),
         margin=dict(l=10, r=10, t=40, b=10),
+        transition=dict(duration=450, easing="cubic-in-out"),
     )
 )
 GREEN = "#22C55E"
 RED = "#EF4444"
 ACCENT = "#3B82F6"
+
+_kpi_anim_counter = {"i": 0}
 
 
 def kpi_card(label, value, sub=None, positive=None):
