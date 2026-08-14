@@ -509,6 +509,21 @@ if page == "📊 Dashboard":
             fig3.update_layout(template=PLOTLY_TEMPLATE, height=300)
             st.plotly_chart(fig3, use_container_width=True)
 
+        # --- NEW: Return on Capital KPI row ---
+        st.markdown("<div style='height:22px'></div>", unsafe_allow_html=True)
+        st.markdown('<div class="section-title">Return on Capital (margin-based)</div>', unsafe_allow_html=True)
+        r3c1, r3c2, r3c3 = st.columns(3)
+        with r3c1:
+            kpi_card("Avg Return / Trade", utils.format_percent(k["avg_return_pct"]),
+                     sub="Average % profit/loss per trade on margin deployed")
+        with r3c2:
+            kpi_card("Best Return", utils.format_percent(k["max_return_pct"]),
+                     sub="Highest single-trade % return")
+        with r3c3:
+            kpi_card("Total Margin Deployed", utils.format_currency(k["total_margin_deployed"], CURRENCY_SYMBOL),
+                     sub="Sum of margin locked across all filtered trades")
+
+        st.markdown("<div style='height:22px'></div>", unsafe_allow_html=True)
         st.markdown('<div class="section-title">Recent Trades</div>', unsafe_allow_html=True)
         recent = filtered.sort_values("exit_time", ascending=False).head(10)
         show_cols = ["exit_time", "instrument", "side", "lot_size", "entry_price", "exit_price", "pnl", "remarks"]
@@ -798,9 +813,13 @@ elif page == "📜 Trade History":
 
         st.caption(f"Showing {len(filtered)} of {len(all_df)} trades")
 
+        # Add computed columns for margin and return %
+        filtered["margin_deployed"] = filtered.apply(utils.margin_deployed, axis=1)
+        filtered["return_pct"] = filtered.apply(utils.return_pct, axis=1)
+
         display_cols = ["id", "exit_time", "instrument", "side", "lot_size", "entry_price",
-                         "exit_price", "fee", "tax", "commission", "swap", "pnl", "strategy",
-                         "remarks", "source"]
+                         "exit_price", "fee", "tax", "commission", "swap", "pnl",
+                         "margin_deployed", "return_pct", "strategy", "remarks", "source"]
         display_cols = [c for c in display_cols if c in filtered.columns]
         edit_df = filtered[display_cols].sort_values("exit_time", ascending=False).reset_index(drop=True)
 
@@ -809,13 +828,15 @@ elif page == "📜 Trade History":
             use_container_width=True,
             hide_index=True,
             num_rows="fixed",
-            disabled=["id", "source"],
+            disabled=["id", "source", "margin_deployed", "return_pct"],
             column_config={
                 "id": st.column_config.NumberColumn("ID", width="small"),
                 "pnl": st.column_config.NumberColumn("P/L", format="%.2f"),
                 "lot_size": st.column_config.NumberColumn("Lot", format="%.4f"),
                 "entry_price": st.column_config.NumberColumn("Entry", format="%.4f"),
                 "exit_price": st.column_config.NumberColumn("Exit", format="%.4f"),
+                "margin_deployed": st.column_config.NumberColumn("Margin ($)", format="%.2f"),
+                "return_pct": st.column_config.NumberColumn("Return %", format="%.2f%%"),
                 "source": st.column_config.TextColumn("Source", width="small"),
             },
             key="trade_history_editor",
@@ -830,7 +851,7 @@ elif page == "📜 Trade History":
                     rid = int(row["id"])
                     updates = {}
                     for col in edit_df.columns:
-                        if col == "id":
+                        if col == "id" or col in ["margin_deployed", "return_pct", "source"]:
                             continue
                         if row[col] != orig_indexed.loc[rid, col]:
                             updates[col] = row[col]
@@ -941,6 +962,49 @@ elif page == "⚙️ Settings":
             mime="text/csv",
             use_container_width=True,
         )
+
+    st.markdown("<div style='height:10px'></div>", unsafe_allow_html=True)
+
+    # ---- NEW: Leverage & Contract Size Settings ----
+    st.markdown('<div class="section-title">Margin & Return Calculations</div>', unsafe_allow_html=True)
+    with st.form("settings_form"):
+        current_leverage = db.get_leverage()
+        new_leverage = st.number_input("Leverage", min_value=1.0, value=float(current_leverage), step=0.5, format="%.1f")
+
+        st.markdown("**Contract sizes (lot = 1)**")
+        st.caption("Defaults: XAUUSD=100, all others=1")
+        # Show all instruments currently in the database plus a blank for adding new
+        instruments = db.distinct_instruments()
+        if not instruments:
+            instruments = ["XAUUSD"]  # fallback
+        contract_sizes = {}
+        for inst in instruments:
+            current_size = db.get_contract_size(inst)
+            new_size = st.number_input(
+                f"Contract size for {inst}",
+                min_value=0.0, value=float(current_size), step=0.1, format="%.2f",
+                key=f"cs_{inst}"
+            )
+            contract_sizes[inst] = new_size
+
+        # Allow adding a new instrument contract size
+        new_instr = st.text_input("Add contract size for a new instrument (optional)", placeholder="e.g. BTCUSD")
+        if new_instr.strip():
+            new_instr = new_instr.strip().upper()
+            default_size = st.number_input(f"Contract size for {new_instr}", min_value=0.0, value=1.0, step=0.1, format="%.2f")
+        else:
+            new_instr = None
+            default_size = None
+
+        submitted_settings = st.form_submit_button("Save Settings", type="primary")
+        if submitted_settings:
+            db.set_setting("leverage", str(new_leverage))
+            for inst, size in contract_sizes.items():
+                db.set_contract_size(inst, size)
+            if new_instr and default_size is not None:
+                db.set_contract_size(new_instr, default_size)
+            st.success("Settings saved.")
+            st.rerun()
 
     st.markdown("<div style='height:10px'></div>", unsafe_allow_html=True)
     st.markdown('<div class="section-title">⚠️ Danger Zone</div>', unsafe_allow_html=True)
