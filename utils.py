@@ -9,6 +9,8 @@ from datetime import datetime
 import numpy as np
 import pandas as pd
 
+from db import get_leverage, get_contract_size
+
 # Columns the broker export uses -> our internal db column names
 BROKER_COLUMN_MAP = {
     "Order Number": "broker_order_id",
@@ -118,6 +120,31 @@ def parse_broker_csv(file_bytes: bytes) -> tuple[pd.DataFrame, str]:
 # Analytics
 # ---------------------------------------------------------------------------
 
+def margin_deployed(row: pd.Series) -> float:
+    """
+    Compute margin (capital deployed) for a single trade row.
+    Uses leverage and contract size from settings.
+    """
+    leverage = get_leverage()
+    instr = row.get("instrument", "").upper()
+    contract_size = get_contract_size(instr)
+    entry = row.get("entry_price", 0.0)
+    lot = row.get("lot_size", 0.0)
+    if leverage <= 0 or entry <= 0 or lot <= 0:
+        return 0.0
+    notional = lot * contract_size * entry
+    return notional / leverage
+
+
+def return_pct(row: pd.Series) -> float:
+    """Return percentage for a single trade: pnl / margin * 100."""
+    margin = margin_deployed(row)
+    pnl = row.get("pnl", 0.0)
+    if margin == 0:
+        return 0.0
+    return (pnl / margin) * 100
+
+
 def compute_kpis(df: pd.DataFrame) -> dict:
     """Core KPI block for the dashboard header."""
     if df.empty:
@@ -127,6 +154,7 @@ def compute_kpis(df: pd.DataFrame) -> dict:
             "expectancy": 0.0, "best_trade": 0.0, "worst_trade": 0.0,
             "max_drawdown": 0.0, "total_fees": 0.0, "avg_rr": 0.0,
             "current_streak": 0, "gross_profit": 0.0, "gross_loss": 0.0,
+            "avg_return_pct": 0.0, "max_return_pct": 0.0, "total_margin_deployed": 0.0,
         }
 
     pnl = df["pnl"]
@@ -166,6 +194,14 @@ def compute_kpis(df: pd.DataFrame) -> dict:
                 break
         streak *= sign
 
+    # ---- New: return % statistics ----
+    # Compute margin and return for each row (caching for speed)
+    margins = df.apply(margin_deployed, axis=1)
+    returns = df.apply(return_pct, axis=1)
+    avg_return = returns.mean() if len(returns) else 0.0
+    max_return = returns.max() if len(returns) else 0.0
+    total_margin = margins.sum()
+
     return {
         "total_pnl": float(pnl.sum()),
         "total_trades": int(len(df)),
@@ -182,6 +218,9 @@ def compute_kpis(df: pd.DataFrame) -> dict:
         "current_streak": int(streak),
         "gross_profit": float(gross_profit),
         "gross_loss": float(gross_loss),
+        "avg_return_pct": float(avg_return),
+        "max_return_pct": float(max_return),
+        "total_margin_deployed": float(total_margin),
     }
 
 
@@ -281,8 +320,14 @@ def monthly_summary(df: pd.DataFrame) -> pd.DataFrame:
     return grouped.sort_values("month")
 
 
-def format_currency(value: float, symbol: str = "\u20b9") -> str:
+def format_currency(value: float, symbol: str = "$") -> str:
     if value is None or (isinstance(value, float) and (np.isnan(value) or np.isinf(value))):
         return "—"
     sign = "-" if value < 0 else ""
     return f"{sign}{symbol}{abs(value):,.2f}"
+
+
+def format_percent(value: float) -> str:
+    if value is None or np.isnan(value) or np.isinf(value):
+        return "—"
+    return f"{value:+.2f}%"
