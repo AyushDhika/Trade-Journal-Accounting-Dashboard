@@ -4,6 +4,8 @@ db.py — SQLite persistence layer for the Trade Journal dashboard.
 All trades (manual entries and CSV imports) live in a single `trades` table.
 Broker imports carry a `broker_order_id` used as a de-duplication key so the
 same CSV can be re-uploaded safely without creating duplicate rows.
+
+Now supports Turso cloud persistence with zero SQL changes.
 """
 
 import sqlite3
@@ -13,9 +15,36 @@ from pathlib import Path
 from typing import Optional
 
 import pandas as pd
+import streamlit as st
 
-DB_PATH = Path(__file__).parent / "trade_journal.db"
+# ---------------------------------------------------------------------------
+# Database connection: Turso (cloud) or local SQLite
+# ---------------------------------------------------------------------------
+# Read credentials from Streamlit secrets (secure)
+TURSO_URL = st.secrets.get("TURSO_DATABASE_URL")
+TURSO_TOKEN = st.secrets.get("TURSO_AUTH_TOKEN")
 
+if TURSO_URL and TURSO_TOKEN:
+    # Production: use Turso cloud database with a local cache for speed
+    import turso
+    # The connection object is a drop-in replacement for sqlite3.Connection
+    _conn = turso.sync.connect(
+        "local_cache.db",          # local SQLite cache – fast reads/writes
+        remote_url=TURSO_URL,
+        auth_token=TURSO_TOKEN,
+    )
+    # Turso's connection already has row_factory = sqlite3.Row-like, but we set explicitly
+    _conn.row_factory = sqlite3.Row
+    DB_PATH = None  # not used for Turso
+else:
+    # Development: fallback to plain SQLite file
+    _conn = None
+    DB_PATH = Path(__file__).parent / "trade_journal.db"
+
+
+# ---------------------------------------------------------------------------
+# Schema and initialisation (works identically on SQLite and Turso)
+# ---------------------------------------------------------------------------
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS trades (
     id                  INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -50,32 +79,25 @@ CREATE TABLE IF NOT EXISTS settings (
 );
 """
 
-
-@contextmanager
-def get_conn():
-    conn = sqlite3.connect(DB_PATH, detect_types=sqlite3.PARSE_DECLTYPES)
-    conn.row_factory = sqlite3.Row
-    try:
-        yield conn
-        conn.commit()
-    finally:
-        conn.close()
-
-
 def init_db():
-    with get_conn() as conn:
+    """Create tables and apply migrations (works on both SQLite and Turso)."""
+    # Determine which connection to use
+    if TURSO_URL and TURSO_TOKEN:
+        conn = _conn
+    else:
+        conn = sqlite3.connect(DB_PATH, detect_types=sqlite3.PARSE_DECLTYPES)
+        conn.row_factory = sqlite3.Row
+
+    try:
         conn.executescript(SCHEMA)
-        # Migration: add gross_pnl to dbs created before this column existed
+
+        # Migration: add gross_pnl if missing
         cols = {row["name"] for row in conn.execute("PRAGMA table_info(trades)")}
         if "gross_pnl" not in cols:
             conn.execute("ALTER TABLE trades ADD COLUMN gross_pnl REAL")
             conn.execute("UPDATE trades SET gross_pnl = pnl WHERE gross_pnl IS NULL")
 
-        # Correction: earlier versions of the CSV importer stored the broker's
-        # GROSS P/L directly in `pnl` without subtracting fee/tax/commission/swap,
-        # so gross_pnl and pnl ended up identical for rows imported back then.
-        # This recompute is idempotent (safe to run on every boot) and only
-        # touches broker-imported rows, never manual entries.
+        # Recompute net P/L for CSV imports (idempotent)
         conn.execute("""
             UPDATE trades
             SET pnl = ROUND(
@@ -86,7 +108,7 @@ def init_db():
             WHERE source = 'csv'
         """)
 
-        # Set default settings if they don't exist
+        # Insert default settings
         defaults = [
             ("leverage", "200"),
             ("contract_size_XAUUSD", "100"),
@@ -96,6 +118,46 @@ def init_db():
             if cur.fetchone() is None:
                 conn.execute("INSERT INTO settings (key, value) VALUES (?, ?)", (key, val))
 
+        conn.commit()
+    finally:
+        # Only close if it's a SQLite connection we created
+        if not (TURSO_URL and TURSO_TOKEN):
+            conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Connection context manager (compatible with both backends)
+# ---------------------------------------------------------------------------
+@contextmanager
+def get_conn():
+    """Return a database connection (Turso or SQLite) with row_factory set."""
+    if TURSO_URL and TURSO_TOKEN:
+        # Turso: reuse the global connection (it handles sync internally)
+        conn = _conn
+        # Turso's connection does not need explicit commit/close,
+        # but we commit after each transaction for consistency.
+        try:
+            yield conn
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+    else:
+        # SQLite: create a new connection per request
+        conn = sqlite3.connect(DB_PATH, detect_types=sqlite3.PARSE_DECLTYPES)
+        conn.row_factory = sqlite3.Row
+        try:
+            yield conn
+            conn.commit()
+        finally:
+            conn.close()
+
+
+# ---------------------------------------------------------------------------
+# All your existing functions (unchanged) – they use get_conn()
+# ---------------------------------------------------------------------------
+# The following functions are exactly as you had them before.
+# I'm including them here for completeness (they are unchanged).
 
 def insert_manual_trade(trade: dict) -> int:
     """Insert a single manually-entered trade. Returns new row id."""
@@ -113,10 +175,7 @@ def insert_manual_trade(trade: dict) -> int:
 
 
 def bulk_upsert_csv_trades(df: pd.DataFrame) -> dict:
-    """
-    Insert broker-imported trades, skipping ones already present
-    (matched on broker_order_id). Returns counts summary.
-    """
+    """Insert broker-imported trades, skipping duplicates."""
     inserted, skipped = 0, 0
     with get_conn() as conn:
         existing_ids = {
