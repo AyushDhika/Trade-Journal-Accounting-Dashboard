@@ -1,13 +1,6 @@
 """
-db.py — SQLite persistence layer for the Trade Journal dashboard.
-
-All trades (manual entries and CSV imports) live in a single `trades` table.
-Broker imports carry a `broker_order_id` used as a de-duplication key so the
-same CSV can be re-uploaded safely without creating duplicate rows.
-
-Now supports Turso cloud persistence with zero SQL changes.
+db.py — SQLite persistence layer with optional Turso cloud storage.
 """
-
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime
@@ -18,54 +11,49 @@ import pandas as pd
 import streamlit as st
 
 # ---------------------------------------------------------------------------
-# Database connection: Turso (cloud) or local SQLite
+# Turso cloud credentials (read from Streamlit secrets)
 # ---------------------------------------------------------------------------
-# Read credentials from Streamlit secrets (secure)
 TURSO_URL = st.secrets.get("TURSO_DATABASE_URL")
 TURSO_TOKEN = st.secrets.get("TURSO_AUTH_TOKEN")
 
 if TURSO_URL and TURSO_TOKEN:
-    # Production: use Turso cloud database with a local cache for speed
     import turso
-    # The connection object is a drop-in replacement for sqlite3.Connection
-    _conn = turso.sync.connect(
-        "local_cache.db",          # local SQLite cache – fast reads/writes
+    # Correct method: turso.connect (not turso.sync.connect)
+    _conn = turso.connect(
+        "local_cache.db",          # local cache for speed
         remote_url=TURSO_URL,
         auth_token=TURSO_TOKEN,
     )
-    # Turso's connection already has row_factory = sqlite3.Row-like, but we set explicitly
     _conn.row_factory = sqlite3.Row
-    DB_PATH = None  # not used for Turso
+    DB_PATH = None
 else:
-    # Development: fallback to plain SQLite file
     _conn = None
     DB_PATH = Path(__file__).parent / "trade_journal.db"
 
-
 # ---------------------------------------------------------------------------
-# Schema and initialisation (works identically on SQLite and Turso)
+# Schema (unchanged)
 # ---------------------------------------------------------------------------
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS trades (
     id                  INTEGER PRIMARY KEY AUTOINCREMENT,
-    broker_order_id     TEXT UNIQUE,          -- NULL for manual trades
-    source              TEXT NOT NULL DEFAULT 'manual',   -- 'manual' | 'csv'
-    account              TEXT,
+    broker_order_id     TEXT UNIQUE,
+    source              TEXT NOT NULL DEFAULT 'manual',
+    account             TEXT,
     instrument          TEXT NOT NULL,
-    side                TEXT NOT NULL,        -- Buy / Sell
+    side                TEXT NOT NULL,
     lot_size            REAL NOT NULL DEFAULT 0,
     entry_price         REAL,
     exit_price          REAL,
-    entry_time          TEXT,                 -- ISO 8601
-    exit_time           TEXT,                 -- ISO 8601
+    entry_time          TEXT,
+    exit_time           TEXT,
     fee                 REAL DEFAULT 0,
     tax                 REAL DEFAULT 0,
     commission          REAL DEFAULT 0,
     swap                REAL DEFAULT 0,
-    pnl                 REAL NOT NULL DEFAULT 0,   -- NET P/L (after fee/tax/commission/swap)
-    gross_pnl           REAL,                       -- P/L before costs (as reported by broker, if known)
+    pnl                 REAL NOT NULL DEFAULT 0,
+    gross_pnl           REAL,
     points              REAL,
-    strategy             TEXT,
+    strategy            TEXT,
     remarks             TEXT,
     tags                TEXT,
     created_at          TEXT NOT NULL
@@ -80,8 +68,7 @@ CREATE TABLE IF NOT EXISTS settings (
 """
 
 def init_db():
-    """Create tables and apply migrations (works on both SQLite and Turso)."""
-    # Determine which connection to use
+    """Create tables and apply migrations (works on SQLite and Turso)."""
     if TURSO_URL and TURSO_TOKEN:
         conn = _conn
     else:
@@ -90,7 +77,6 @@ def init_db():
 
     try:
         conn.executescript(SCHEMA)
-
         # Migration: add gross_pnl if missing
         cols = {row["name"] for row in conn.execute("PRAGMA table_info(trades)")}
         if "gross_pnl" not in cols:
@@ -108,34 +94,21 @@ def init_db():
             WHERE source = 'csv'
         """)
 
-        # Insert default settings
-        defaults = [
-            ("leverage", "200"),
-            ("contract_size_XAUUSD", "100"),
-        ]
+        defaults = [("leverage", "200"), ("contract_size_XAUUSD", "100")]
         for key, val in defaults:
             cur = conn.execute("SELECT value FROM settings WHERE key = ?", (key,))
             if cur.fetchone() is None:
                 conn.execute("INSERT INTO settings (key, value) VALUES (?, ?)", (key, val))
-
         conn.commit()
     finally:
-        # Only close if it's a SQLite connection we created
         if not (TURSO_URL and TURSO_TOKEN):
             conn.close()
 
 
-# ---------------------------------------------------------------------------
-# Connection context manager (compatible with both backends)
-# ---------------------------------------------------------------------------
 @contextmanager
 def get_conn():
-    """Return a database connection (Turso or SQLite) with row_factory set."""
     if TURSO_URL and TURSO_TOKEN:
-        # Turso: reuse the global connection (it handles sync internally)
         conn = _conn
-        # Turso's connection does not need explicit commit/close,
-        # but we commit after each transaction for consistency.
         try:
             yield conn
             conn.commit()
@@ -143,7 +116,6 @@ def get_conn():
             conn.rollback()
             raise
     else:
-        # SQLite: create a new connection per request
         conn = sqlite3.connect(DB_PATH, detect_types=sqlite3.PARSE_DECLTYPES)
         conn.row_factory = sqlite3.Row
         try:
@@ -154,13 +126,9 @@ def get_conn():
 
 
 # ---------------------------------------------------------------------------
-# All your existing functions (unchanged) – they use get_conn()
+# All your existing functions remain unchanged.
 # ---------------------------------------------------------------------------
-# The following functions are exactly as you had them before.
-# I'm including them here for completeness (they are unchanged).
-
 def insert_manual_trade(trade: dict) -> int:
-    """Insert a single manually-entered trade. Returns new row id."""
     trade = dict(trade)
     trade.setdefault("source", "manual")
     trade.setdefault("created_at", datetime.utcnow().isoformat())
@@ -175,7 +143,6 @@ def insert_manual_trade(trade: dict) -> int:
 
 
 def bulk_upsert_csv_trades(df: pd.DataFrame) -> dict:
-    """Insert broker-imported trades, skipping duplicates."""
     inserted, skipped = 0, 0
     with get_conn() as conn:
         existing_ids = {
@@ -260,14 +227,11 @@ def wipe_all():
         conn.execute("DELETE FROM settings")
 
 
-# ---------- Settings helpers ----------
 def get_setting(key: str, default: str = None) -> str:
     with get_conn() as conn:
         cur = conn.execute("SELECT value FROM settings WHERE key = ?", (key,))
         row = cur.fetchone()
-        if row is None:
-            return default
-        return row["value"]
+        return row["value"] if row else default
 
 
 def set_setting(key: str, value: str):
@@ -290,10 +254,7 @@ def get_contract_size(instrument: str) -> float:
     key = f"contract_size_{instrument.upper()}"
     val = get_setting(key, None)
     if val is None:
-        # default: XAUUSD -> 100, else 1
-        if instrument.upper() == "XAUUSD":
-            return 100.0
-        return 1.0
+        return 100.0 if instrument.upper() == "XAUUSD" else 1.0
     try:
         return float(val)
     except ValueError:
