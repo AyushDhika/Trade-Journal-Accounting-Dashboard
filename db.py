@@ -18,12 +18,9 @@ TURSO_TOKEN = st.secrets.get("TURSO_AUTH_TOKEN")
 
 if TURSO_URL and TURSO_TOKEN:
     import turso
-    # Correct method: turso.connect (not turso.sync.connect)
-    _conn = turso.connect(
-        "local_cache.db",          # local cache for speed
-        remote_url=TURSO_URL,
-        auth_token=TURSO_TOKEN,
-    )
+    # Correct signature: turso.connect(remote_url, auth_token)
+    # The local cache file is automatically managed by the library.
+    _conn = turso.connect(TURSO_URL, TURSO_TOKEN)
     _conn.row_factory = sqlite3.Row
     DB_PATH = None
 else:
