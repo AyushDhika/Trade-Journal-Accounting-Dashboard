@@ -1,6 +1,11 @@
 """
-db.py — SQLite persistence layer with optional Turso cloud storage.
+db.py — SQLite persistence layer for the Trade Journal dashboard.
+
+All trades (manual entries and CSV imports) live in a single `trades` table.
+Broker imports carry a `broker_order_id` used as a de-duplication key so the
+same CSV can be re-uploaded safely without creating duplicate rows.
 """
+
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime
@@ -8,48 +13,30 @@ from pathlib import Path
 from typing import Optional
 
 import pandas as pd
-import streamlit as st
 
-# ---------------------------------------------------------------------------
-# Turso cloud credentials (read from Streamlit secrets)
-# ---------------------------------------------------------------------------
-TURSO_URL = st.secrets.get("TURSO_DATABASE_URL")
-TURSO_TOKEN = st.secrets.get("TURSO_AUTH_TOKEN")
+DB_PATH = Path(__file__).parent / "trade_journal.db"
 
-if TURSO_URL and TURSO_TOKEN:
-    import turso
-    # Correct: URL as first arg, auth_token as keyword
-    _conn = turso.connect(TURSO_URL, auth_token=TURSO_TOKEN)
-    _conn.row_factory = sqlite3.Row
-    DB_PATH = None
-else:
-    _conn = None
-    DB_PATH = Path(__file__).parent / "trade_journal.db"
-
-# ---------------------------------------------------------------------------
-# Schema (unchanged)
-# ---------------------------------------------------------------------------
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS trades (
     id                  INTEGER PRIMARY KEY AUTOINCREMENT,
-    broker_order_id     TEXT UNIQUE,
-    source              TEXT NOT NULL DEFAULT 'manual',
-    account             TEXT,
+    broker_order_id     TEXT UNIQUE,          -- NULL for manual trades
+    source              TEXT NOT NULL DEFAULT 'manual',   -- 'manual' | 'csv'
+    account              TEXT,
     instrument          TEXT NOT NULL,
-    side                TEXT NOT NULL,
+    side                TEXT NOT NULL,        -- Buy / Sell
     lot_size            REAL NOT NULL DEFAULT 0,
     entry_price         REAL,
     exit_price          REAL,
-    entry_time          TEXT,
-    exit_time           TEXT,
+    entry_time          TEXT,                 -- ISO 8601
+    exit_time           TEXT,                 -- ISO 8601
     fee                 REAL DEFAULT 0,
     tax                 REAL DEFAULT 0,
     commission          REAL DEFAULT 0,
     swap                REAL DEFAULT 0,
-    pnl                 REAL NOT NULL DEFAULT 0,
-    gross_pnl           REAL,
+    pnl                 REAL NOT NULL DEFAULT 0,   -- NET P/L (after fee/tax/commission/swap)
+    gross_pnl           REAL,                       -- P/L before costs (as reported by broker, if known)
     points              REAL,
-    strategy            TEXT,
+    strategy             TEXT,
     remarks             TEXT,
     tags                TEXT,
     created_at          TEXT NOT NULL
@@ -63,23 +50,32 @@ CREATE TABLE IF NOT EXISTS settings (
 );
 """
 
-def init_db():
-    """Create tables and apply migrations (works on SQLite and Turso)."""
-    if TURSO_URL and TURSO_TOKEN:
-        conn = _conn
-    else:
-        conn = sqlite3.connect(DB_PATH, detect_types=sqlite3.PARSE_DECLTYPES)
-        conn.row_factory = sqlite3.Row
 
+@contextmanager
+def get_conn():
+    conn = sqlite3.connect(DB_PATH, detect_types=sqlite3.PARSE_DECLTYPES)
+    conn.row_factory = sqlite3.Row
     try:
+        yield conn
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def init_db():
+    with get_conn() as conn:
         conn.executescript(SCHEMA)
-        # Migration: add gross_pnl if missing
+        # Migration: add gross_pnl to dbs created before this column existed
         cols = {row["name"] for row in conn.execute("PRAGMA table_info(trades)")}
         if "gross_pnl" not in cols:
             conn.execute("ALTER TABLE trades ADD COLUMN gross_pnl REAL")
             conn.execute("UPDATE trades SET gross_pnl = pnl WHERE gross_pnl IS NULL")
 
-        # Recompute net P/L for CSV imports (idempotent)
+        # Correction: earlier versions of the CSV importer stored the broker's
+        # GROSS P/L directly in `pnl` without subtracting fee/tax/commission/swap,
+        # so gross_pnl and pnl ended up identical for rows imported back then.
+        # This recompute is idempotent (safe to run on every boot) and only
+        # touches broker-imported rows, never manual entries.
         conn.execute("""
             UPDATE trades
             SET pnl = ROUND(
@@ -90,41 +86,19 @@ def init_db():
             WHERE source = 'csv'
         """)
 
-        defaults = [("leverage", "200"), ("contract_size_XAUUSD", "100")]
+        # Set default settings if they don't exist
+        defaults = [
+            ("leverage", "200"),
+            ("contract_size_XAUUSD", "100"),
+        ]
         for key, val in defaults:
             cur = conn.execute("SELECT value FROM settings WHERE key = ?", (key,))
             if cur.fetchone() is None:
                 conn.execute("INSERT INTO settings (key, value) VALUES (?, ?)", (key, val))
-        conn.commit()
-    finally:
-        if not (TURSO_URL and TURSO_TOKEN):
-            conn.close()
 
 
-@contextmanager
-def get_conn():
-    if TURSO_URL and TURSO_TOKEN:
-        conn = _conn
-        try:
-            yield conn
-            conn.commit()
-        except Exception:
-            conn.rollback()
-            raise
-    else:
-        conn = sqlite3.connect(DB_PATH, detect_types=sqlite3.PARSE_DECLTYPES)
-        conn.row_factory = sqlite3.Row
-        try:
-            yield conn
-            conn.commit()
-        finally:
-            conn.close()
-
-
-# ---------------------------------------------------------------------------
-# All your existing functions remain unchanged.
-# ---------------------------------------------------------------------------
 def insert_manual_trade(trade: dict) -> int:
+    """Insert a single manually-entered trade. Returns new row id."""
     trade = dict(trade)
     trade.setdefault("source", "manual")
     trade.setdefault("created_at", datetime.utcnow().isoformat())
@@ -139,6 +113,10 @@ def insert_manual_trade(trade: dict) -> int:
 
 
 def bulk_upsert_csv_trades(df: pd.DataFrame) -> dict:
+    """
+    Insert broker-imported trades, skipping ones already present
+    (matched on broker_order_id). Returns counts summary.
+    """
     inserted, skipped = 0, 0
     with get_conn() as conn:
         existing_ids = {
@@ -223,11 +201,14 @@ def wipe_all():
         conn.execute("DELETE FROM settings")
 
 
+# ---------- Settings helpers ----------
 def get_setting(key: str, default: str = None) -> str:
     with get_conn() as conn:
         cur = conn.execute("SELECT value FROM settings WHERE key = ?", (key,))
         row = cur.fetchone()
-        return row["value"] if row else default
+        if row is None:
+            return default
+        return row["value"]
 
 
 def set_setting(key: str, value: str):
@@ -250,7 +231,10 @@ def get_contract_size(instrument: str) -> float:
     key = f"contract_size_{instrument.upper()}"
     val = get_setting(key, None)
     if val is None:
-        return 100.0 if instrument.upper() == "XAUUSD" else 1.0
+        # default: XAUUSD -> 100, else 1
+        if instrument.upper() == "XAUUSD":
+            return 100.0
+        return 1.0
     try:
         return float(val)
     except ValueError:
