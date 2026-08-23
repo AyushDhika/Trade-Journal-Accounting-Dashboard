@@ -24,9 +24,64 @@ expectancy, and breakdowns by instrument / weekday / hour.
   average R:R, total fees paid.
 - **Settings** — full backup export, and a confirm-to-wipe danger zone.
 
-Data is stored locally in a SQLite file (`trade_journal.db`) that's created
-automatically next to `app.py` the first time you run the app — nothing is
-sent anywhere.
+Data is stored in SQLite by default (`trade_journal.db`, created automatically
+next to `app.py` on first run) — nothing is sent anywhere. **On Streamlit
+Community Cloud specifically, this local file is wiped whenever the app
+sleeps, reboots, or you push new code**, since the container filesystem
+outside your git repo is ephemeral. To keep your trades persistent across
+sleeps/reboots, connect a free [Turso](https://turso.tech) database — see
+**Persistent storage on Streamlit Cloud** below. The app auto-detects
+whether Turso credentials are present and switches backends with zero code
+changes on your end.
+
+## Persistent storage on Streamlit Cloud (Turso)
+
+Turso is a free, hosted, SQLite-compatible database — the app already
+speaks its exact SQL dialect, so connecting it is just a couple of
+credentials, no code changes needed.
+
+1. **Create a Turso account & database** — go to [turso.tech](https://turso.tech),
+   sign up (free tier is generous — 500 databases, 9 GB storage), then either:
+   - Use the web dashboard: **Create Database** → name it (e.g. `trade-journal`) → pick a region close to you.
+   - Or via CLI: `curl -sSfL https://get.tur.so/install.sh | bash`, then
+     `turso auth login`, then `turso db create trade-journal`.
+2. **Get your database URL**:
+   - Dashboard: open the database → copy the **URL** shown (starts with `libsql://...`).
+   - CLI: `turso db show trade-journal --url`
+3. **Create an auth token**:
+   - Dashboard: database page → **Create Token**.
+   - CLI: `turso db tokens create trade-journal`
+4. **Add both as Secrets in Streamlit Cloud**: open your app → **Manage app**
+   (bottom right) → **Settings** → **Secrets**, and paste:
+   ```toml
+   TURSO_DATABASE_URL = "libsql://your-db-name-yourorg.turso.io"
+   TURSO_AUTH_TOKEN = "your-token-here"
+   ```
+5. **Reboot the app**. Open **⚙️ Settings** in the sidebar — it should now
+   show "✅ Connected to Turso (persistent cloud)". Re-import your CSV one
+   last time (since the old ephemeral data won't carry over automatically)
+   and it'll persist from then on.
+
+For local development, just don't set these two variables (env vars also
+work, e.g. `export TURSO_DATABASE_URL=...`) and the app quietly falls back
+to the local SQLite file — no other changes needed either way.
+
+## Margin, leverage & % return
+
+The **⚙️ Settings** page lets you set your account leverage (e.g. `200` for
+1:200) and a contract size per instrument (defaults: XAUUSD = 100 oz/lot,
+BTCUSD/ETHUSD = 1 coin/lot, EURUSD = 100,000 units/lot — edit or add rows
+as needed). These feed the **Return on Capital Deployed** section on the
+Dashboard and the `return_pct` / `margin_deployed` columns in Trade History:
+
+```
+margin_deployed = (lot_size × contract_size × entry_price) ÷ leverage
+return_pct      = net_pnl ÷ margin_deployed × 100
+```
+
+This intentionally does **not** use account-balance-based % return, since
+that conflates trading performance with deposits/withdrawals — margin-based
+% stays accurate regardless of how much cash you've added to the account.
 
 ## Setup
 
