@@ -478,34 +478,6 @@ if page == "📊 Dashboard":
                     f"({cost_pct:.1f}% of gross P/L)" + (f" · Swap/overnight interest: {utils.format_currency(costs['swap'], CURRENCY_SYMBOL)}" if costs["swap"] else ""))
 
         st.markdown("<div style='height:22px'></div>", unsafe_allow_html=True)
-        st.markdown('<div class="section-title">Return on Capital Deployed</div>', unsafe_allow_html=True)
-        leverage = db.get_leverage()
-        contract_sizes = db.get_contract_sizes()
-        enriched = utils.add_return_pct(filtered, leverage, contract_sizes)
-        valid_margin = enriched["margin_deployed"].dropna()
-        total_margin = valid_margin.sum()
-        pnl_on_valid = enriched.loc[valid_margin.index, "pnl"].sum()
-        agg_return_pct = (pnl_on_valid / total_margin * 100) if total_margin else 0.0
-        avg_trade_return_pct = enriched["return_pct"].mean() if enriched["return_pct"].notna().any() else 0.0
-        best_return = enriched["return_pct"].max() if enriched["return_pct"].notna().any() else 0.0
-        worst_return = enriched["return_pct"].min() if enriched["return_pct"].notna().any() else 0.0
-
-        rc1, rc2, rc3, rc4 = st.columns(4)
-        with rc1:
-            kpi_card("Return on Capital", f"{agg_return_pct:+.2f}%",
-                      sub=f"Net P/L ÷ total margin deployed", positive=(agg_return_pct >= 0))
-        with rc2:
-            kpi_card("Avg Return / Trade", f"{avg_trade_return_pct:+.2f}%",
-                      sub=f"1:{int(leverage)} leverage", positive=(avg_trade_return_pct >= 0))
-        with rc3:
-            kpi_card("Best Trade Return", f"{best_return:+.2f}%", positive=True)
-        with rc4:
-            kpi_card("Worst Trade Return", f"{worst_return:+.2f}%", positive=False)
-        st.caption(f"Total capital deployed across {len(valid_margin)} trade(s): "
-                    f"**{utils.format_currency(total_margin, CURRENCY_SYMBOL)}** at 1:{int(leverage)} leverage. "
-                    f"Adjust leverage or per-instrument contract size in **⚙️ Settings**.")
-
-        st.markdown("<div style='height:22px'></div>", unsafe_allow_html=True)
         st.markdown('<div class="section-title">Equity Curve</div>', unsafe_allow_html=True)
         eq = utils.equity_curve(filtered)
         fig = go.Figure()
@@ -537,6 +509,21 @@ if page == "📊 Dashboard":
             fig3.update_layout(template=PLOTLY_TEMPLATE, height=300)
             st.plotly_chart(fig3, use_container_width=True)
 
+        # --- NEW: Return on Capital KPI row ---
+        st.markdown("<div style='height:22px'></div>", unsafe_allow_html=True)
+        st.markdown('<div class="section-title">Return on Capital (margin-based)</div>', unsafe_allow_html=True)
+        r3c1, r3c2, r3c3 = st.columns(3)
+        with r3c1:
+            kpi_card("Avg Return / Trade", utils.format_percent(k["avg_return_pct"]),
+                     sub="Average % profit/loss per trade on margin deployed")
+        with r3c2:
+            kpi_card("Best Return", utils.format_percent(k["max_return_pct"]),
+                     sub="Highest single-trade % return")
+        with r3c3:
+            kpi_card("Total Margin Deployed", utils.format_currency(k["total_margin_deployed"], CURRENCY_SYMBOL),
+                     sub="Sum of margin locked across all filtered trades")
+
+        st.markdown("<div style='height:22px'></div>", unsafe_allow_html=True)
         st.markdown('<div class="section-title">Recent Trades</div>', unsafe_allow_html=True)
         recent = filtered.sort_values("exit_time", ascending=False).head(10)
         show_cols = ["exit_time", "instrument", "side", "lot_size", "entry_price", "exit_price", "pnl", "remarks"]
@@ -826,9 +813,9 @@ elif page == "📜 Trade History":
 
         st.caption(f"Showing {len(filtered)} of {len(all_df)} trades")
 
-        leverage = db.get_leverage()
-        contract_sizes = db.get_contract_sizes()
-        filtered = utils.add_return_pct(filtered, leverage, contract_sizes)
+        # Add computed columns for margin and return %
+        filtered["margin_deployed"] = filtered.apply(utils.margin_deployed, axis=1)
+        filtered["return_pct"] = filtered.apply(utils.return_pct, axis=1)
 
         display_cols = ["id", "exit_time", "instrument", "side", "lot_size", "entry_price",
                          "exit_price", "fee", "tax", "commission", "swap", "pnl",
@@ -836,21 +823,19 @@ elif page == "📜 Trade History":
         display_cols = [c for c in display_cols if c in filtered.columns]
         edit_df = filtered[display_cols].sort_values("exit_time", ascending=False).reset_index(drop=True)
 
-        NON_EDITABLE = {"id", "source", "margin_deployed", "return_pct"}
-
         edited = st.data_editor(
             edit_df,
             use_container_width=True,
             hide_index=True,
             num_rows="fixed",
-            disabled=list(NON_EDITABLE),
+            disabled=["id", "source", "margin_deployed", "return_pct"],
             column_config={
                 "id": st.column_config.NumberColumn("ID", width="small"),
                 "pnl": st.column_config.NumberColumn("P/L", format="%.2f"),
                 "lot_size": st.column_config.NumberColumn("Lot", format="%.4f"),
                 "entry_price": st.column_config.NumberColumn("Entry", format="%.4f"),
                 "exit_price": st.column_config.NumberColumn("Exit", format="%.4f"),
-                "margin_deployed": st.column_config.NumberColumn("Margin Deployed", format="%.2f"),
+                "margin_deployed": st.column_config.NumberColumn("Margin ($)", format="%.2f"),
                 "return_pct": st.column_config.NumberColumn("Return %", format="%.2f%%"),
                 "source": st.column_config.TextColumn("Source", width="small"),
             },
@@ -866,7 +851,7 @@ elif page == "📜 Trade History":
                     rid = int(row["id"])
                     updates = {}
                     for col in edit_df.columns:
-                        if col == "id" or col in NON_EDITABLE:
+                        if col == "id" or col in ["margin_deployed", "return_pct", "source"]:
                             continue
                         if row[col] != orig_indexed.loc[rid, col]:
                             updates[col] = row[col]
@@ -960,56 +945,6 @@ elif page == "🔍 Analytics":
 # PAGE: Settings
 # ---------------------------------------------------------------------------
 elif page == "⚙️ Settings":
-    st.markdown('<div class="section-title">Storage Backend</div>', unsafe_allow_html=True)
-    backend = db.backend_name()
-    if "Turso" in backend:
-        st.success(f"✅ Connected to **{backend}** — your trades persist across app sleeps/reboots/redeploys.")
-    else:
-        st.warning(
-            f"⚠️ Currently on **{backend}**. On Streamlit Community Cloud, this file is wiped whenever "
-            "the app sleeps, reboots, or you push new code — every trade will be lost. "
-            "Set `TURSO_DATABASE_URL` (and `TURSO_AUTH_TOKEN`) in your app's Secrets to switch to "
-            "persistent storage. See the README for step-by-step setup."
-        )
-
-    st.markdown("<div style='height:14px'></div>", unsafe_allow_html=True)
-    st.markdown('<div class="section-title">Margin & Leverage</div>', unsafe_allow_html=True)
-    st.caption("Used to calculate **Return on Capital Deployed** on the Dashboard and Trade History. "
-                "Margin per trade = (lot size × contract size × entry price) ÷ leverage.")
-
-    current_leverage = db.get_leverage()
-    new_leverage = st.number_input("Account leverage (e.g. 200 for 1:200)", min_value=1, value=int(current_leverage), step=10)
-    if st.button("Save leverage"):
-        db.set_leverage(int(new_leverage))
-        st.success(f"Leverage set to 1:{int(new_leverage)}.")
-        st.rerun()
-
-    st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
-    st.markdown("**Per-instrument contract size**")
-    sizes = db.get_contract_sizes()
-    sizes_df = pd.DataFrame(
-        [{"instrument": k, "contract_size": v} for k, v in sorted(sizes.items())]
-    )
-    edited_sizes = st.data_editor(
-        sizes_df, num_rows="dynamic", hide_index=True, use_container_width=True,
-        column_config={
-            "instrument": st.column_config.TextColumn("Instrument"),
-            "contract_size": st.column_config.NumberColumn("Contract Size (units per 1.0 lot)", format="%.4f"),
-        },
-        key="contract_size_editor",
-    )
-    if st.button("Save contract sizes"):
-        cleaned = edited_sizes.dropna(subset=["instrument"])
-        cleaned = cleaned[cleaned["instrument"].str.strip() != ""]
-        new_map = {row["instrument"].strip().upper(): row["contract_size"] for _, row in cleaned.iterrows()}
-        db.set_contract_sizes(new_map)
-        removed = set(sizes.keys()) - set(new_map.keys())
-        for instrument in removed:
-            db.delete_contract_size(instrument)
-        st.success("Contract sizes saved.")
-        st.rerun()
-
-    st.markdown("<div style='height:18px'></div>", unsafe_allow_html=True)
     st.markdown('<div class="section-title">Data Management</div>', unsafe_allow_html=True)
 
     all_df = db.fetch_trades()
@@ -1017,7 +952,7 @@ elif page == "⚙️ Settings":
     with c1:
         st.metric("Total trades in database", len(all_df))
     with c2:
-        st.metric("Backend", backend.split(" (")[0])
+        st.metric("Database file", str(db.DB_PATH.name))
 
     if not all_df.empty:
         st.download_button(
@@ -1027,6 +962,49 @@ elif page == "⚙️ Settings":
             mime="text/csv",
             use_container_width=True,
         )
+
+    st.markdown("<div style='height:10px'></div>", unsafe_allow_html=True)
+
+    # ---- NEW: Leverage & Contract Size Settings ----
+    st.markdown('<div class="section-title">Margin & Return Calculations</div>', unsafe_allow_html=True)
+    with st.form("settings_form"):
+        current_leverage = db.get_leverage()
+        new_leverage = st.number_input("Leverage", min_value=1.0, value=float(current_leverage), step=0.5, format="%.1f")
+
+        st.markdown("**Contract sizes (lot = 1)**")
+        st.caption("Defaults: XAUUSD=100, all others=1")
+        # Show all instruments currently in the database plus a blank for adding new
+        instruments = db.distinct_instruments()
+        if not instruments:
+            instruments = ["XAUUSD"]  # fallback
+        contract_sizes = {}
+        for inst in instruments:
+            current_size = db.get_contract_size(inst)
+            new_size = st.number_input(
+                f"Contract size for {inst}",
+                min_value=0.0, value=float(current_size), step=0.1, format="%.2f",
+                key=f"cs_{inst}"
+            )
+            contract_sizes[inst] = new_size
+
+        # Allow adding a new instrument contract size
+        new_instr = st.text_input("Add contract size for a new instrument (optional)", placeholder="e.g. BTCUSD")
+        if new_instr.strip():
+            new_instr = new_instr.strip().upper()
+            default_size = st.number_input(f"Contract size for {new_instr}", min_value=0.0, value=1.0, step=0.1, format="%.2f")
+        else:
+            new_instr = None
+            default_size = None
+
+        submitted_settings = st.form_submit_button("Save Settings", type="primary")
+        if submitted_settings:
+            db.set_setting("leverage", str(new_leverage))
+            for inst, size in contract_sizes.items():
+                db.set_contract_size(inst, size)
+            if new_instr and default_size is not None:
+                db.set_contract_size(new_instr, default_size)
+            st.success("Settings saved.")
+            st.rerun()
 
     st.markdown("<div style='height:10px'></div>", unsafe_allow_html=True)
     st.markdown('<div class="section-title">⚠️ Danger Zone</div>', unsafe_allow_html=True)
