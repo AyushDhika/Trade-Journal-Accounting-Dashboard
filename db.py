@@ -1,12 +1,30 @@
 """
-db.py — SQLite persistence layer for the Trade Journal dashboard.
+db.py — Persistence layer for the Trade Journal dashboard.
+
+Backend selection (automatic):
+  - If TURSO_DATABASE_URL (+ optionally TURSO_AUTH_TOKEN) is set — via
+    environment variables or Streamlit secrets — trades are stored in a
+    remote Turso database (libSQL, SQLite-compatible). This is what makes
+    data survive Streamlit Community Cloud sleeping/rebooting, since Turso
+    is a separate persistent service, not a file inside the app container.
+  - Otherwise, falls back to a local SQLite file (trade_journal.db) next to
+    this script — fine for local development, but ephemeral on most cloud
+    hosts.
+
+Both backends speak the same SQL (libSQL is a SQLite-compatible engine), so
+nearly every query below is backend-agnostic. The only real difference is
+that raw libSQL rows come back as plain tuples instead of sqlite3.Row, so
+`_rows()` below normalizes both into plain dicts before the rest of the
+code ever sees them — every other function is unchanged either way.
 
 All trades (manual entries and CSV imports) live in a single `trades` table.
 Broker imports carry a `broker_order_id` used as a de-duplication key so the
 same CSV can be re-uploaded safely without creating duplicate rows.
 """
 
+import os
 import sqlite3
+import warnings
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
@@ -45,16 +63,63 @@ CREATE INDEX IF NOT EXISTS idx_trades_exit_time ON trades(exit_time);
 CREATE INDEX IF NOT EXISTS idx_trades_instrument ON trades(instrument);
 
 CREATE TABLE IF NOT EXISTS settings (
-    key   TEXT PRIMARY KEY,
-    value TEXT NOT NULL
+    key    TEXT PRIMARY KEY,
+    value  TEXT
+);
+CREATE TABLE IF NOT EXISTS contract_sizes (
+    instrument     TEXT PRIMARY KEY,
+    contract_size  REAL NOT NULL
 );
 """
+
+DEFAULT_LEVERAGE = 200
+DEFAULT_CONTRACT_SIZES = {
+    "XAUUSD": 100,      # 1 lot = 100 troy oz (standard for gold CFDs)
+    "XAUUSD+": 100,
+    "BTCUSD": 1,        # 1 lot = 1 BTC on most crypto-CFD brokers
+    "ETHUSD": 1,        # 1 lot = 1 ETH
+    "EURUSD": 100000,   # standard forex lot
+}
+
+
+# ---------------------------------------------------------------------------
+# Backend connection
+# ---------------------------------------------------------------------------
+
+def _turso_creds():
+    """Looks for Turso credentials in env vars first, then Streamlit secrets."""
+    url = os.environ.get("TURSO_DATABASE_URL")
+    token = os.environ.get("TURSO_AUTH_TOKEN")
+    if url:
+        return url, token
+    try:
+        import streamlit as st
+        url = st.secrets.get("TURSO_DATABASE_URL")
+        token = st.secrets.get("TURSO_AUTH_TOKEN")
+    except Exception:
+        return None, None
+    return url, token
+
+
+def backend_name() -> str:
+    url, _ = _turso_creds()
+    return "Turso (persistent cloud)" if url else "Local SQLite (ephemeral)"
+
+
+def _raw_connect():
+    url, token = _turso_creds()
+    if url:
+        import libsql_experimental as libsql
+        return libsql.connect(database=url, auth_token=token or "")
+    conn = sqlite3.connect(DB_PATH, detect_types=sqlite3.PARSE_DECLTYPES)
+    conn.row_factory = sqlite3.Row
+    return conn
 
 
 @contextmanager
 def get_conn():
-    conn = sqlite3.connect(DB_PATH, detect_types=sqlite3.PARSE_DECLTYPES)
-    conn.row_factory = sqlite3.Row
+    raw_conn = _raw_connect()
+    conn = _ExecuteTupleWrapper(raw_conn)
     try:
         yield conn
         conn.commit()
@@ -62,11 +127,68 @@ def get_conn():
         conn.close()
 
 
+class _ExecuteTupleWrapper:
+    """
+    Thin pass-through wrapper around the raw connection that guarantees
+    parameters are always passed as a tuple. sqlite3 accepts both lists and
+    tuples; libsql_experimental (Turso's driver) only accepts tuples. Rather
+    than hunt down every call site, every query in this module routes
+    through here so both backends behave identically.
+    """
+    def __init__(self, raw_conn):
+        self._conn = raw_conn
+
+    def execute(self, sql, params=None):
+        if params is None:
+            return self._conn.execute(sql)
+        return self._conn.execute(sql, tuple(params))
+
+    def executescript(self, script):
+        return self._conn.executescript(script)
+
+    def commit(self):
+        self._conn.commit()
+
+    def close(self):
+        self._conn.close()
+
+    @property
+    def raw(self):
+        """The underlying real connection — used where a library (pandas)
+        needs the actual DBAPI2-ish object rather than this wrapper."""
+        return self._conn
+
+
+def _rows(cursor_or_rows, cursor=None) -> list:
+    """
+    Normalizes query results into a list of plain dicts, regardless of
+    backend. Accepts either a cursor (call .fetchall() on it) or an
+    already-fetched list of rows plus the cursor they came from.
+    """
+    if cursor is None:
+        cursor = cursor_or_rows
+        raw_rows = cursor.fetchall()
+    else:
+        raw_rows = cursor_or_rows
+    if not raw_rows:
+        return []
+    if isinstance(raw_rows[0], sqlite3.Row):
+        return [dict(r) for r in raw_rows]
+    cols = [d[0] for d in cursor.description]
+    return [dict(zip(cols, r)) for r in raw_rows]
+
+
+# ---------------------------------------------------------------------------
+# Schema init + migrations
+# ---------------------------------------------------------------------------
+
 def init_db():
     with get_conn() as conn:
         conn.executescript(SCHEMA)
+
         # Migration: add gross_pnl to dbs created before this column existed
-        cols = {row["name"] for row in conn.execute("PRAGMA table_info(trades)")}
+        info_cur = conn.execute("PRAGMA table_info(trades)")
+        cols = {r["name"] for r in _rows(info_cur)}
         if "gross_pnl" not in cols:
             conn.execute("ALTER TABLE trades ADD COLUMN gross_pnl REAL")
             conn.execute("UPDATE trades SET gross_pnl = pnl WHERE gross_pnl IS NULL")
@@ -85,16 +207,6 @@ def init_db():
             2)
             WHERE source = 'csv'
         """)
-
-        # Set default settings if they don't exist
-        defaults = [
-            ("leverage", "200"),
-            ("contract_size_XAUUSD", "100"),
-        ]
-        for key, val in defaults:
-            cur = conn.execute("SELECT value FROM settings WHERE key = ?", (key,))
-            if cur.fetchone() is None:
-                conn.execute("INSERT INTO settings (key, value) VALUES (?, ?)", (key, val))
 
 
 def insert_manual_trade(trade: dict) -> int:
@@ -119,12 +231,10 @@ def bulk_upsert_csv_trades(df: pd.DataFrame) -> dict:
     """
     inserted, skipped = 0, 0
     with get_conn() as conn:
-        existing_ids = {
-            row["broker_order_id"]
-            for row in conn.execute(
-                "SELECT broker_order_id FROM trades WHERE broker_order_id IS NOT NULL"
-            )
-        }
+        id_cur = conn.execute(
+            "SELECT broker_order_id FROM trades WHERE broker_order_id IS NOT NULL"
+        )
+        existing_ids = {r["broker_order_id"] for r in _rows(id_cur)}
         for _, row in df.iterrows():
             oid = str(row["broker_order_id"])
             if oid in existing_ids:
@@ -162,13 +272,17 @@ def fetch_trades(
         params.extend(instruments)
     query += " ORDER BY exit_time DESC"
     with get_conn() as conn:
-        df = pd.read_sql_query(query, conn, params=params)
+        # pandas needs the real DBAPI2-ish connection, not our tuple-coercing
+        # wrapper — works for both sqlite3 and libSQL connections either way.
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            df = pd.read_sql_query(query, conn.raw, params=tuple(params))
     return df
 
 
 def delete_trade(trade_id: int):
     with get_conn() as conn:
-        conn.execute("DELETE FROM trades WHERE id = ?", (trade_id,))
+        conn.execute("DELETE FROM trades WHERE id = ?", (int(trade_id),))
 
 
 def update_trade(trade_id: int, updates: dict):
@@ -178,69 +292,75 @@ def update_trade(trade_id: int, updates: dict):
     with get_conn() as conn:
         conn.execute(
             f"UPDATE trades SET {set_clause} WHERE id = ?",
-            list(updates.values()) + [trade_id],
+            list(updates.values()) + [int(trade_id)],
         )
 
 
 def distinct_instruments() -> list:
     with get_conn() as conn:
-        rows = conn.execute(
-            "SELECT DISTINCT instrument FROM trades ORDER BY instrument"
-        ).fetchall()
+        cur = conn.execute("SELECT DISTINCT instrument FROM trades ORDER BY instrument")
+        rows = _rows(cur)
     return [r["instrument"] for r in rows]
 
 
 def trade_count() -> int:
     with get_conn() as conn:
-        return conn.execute("SELECT COUNT(*) c FROM trades").fetchone()["c"]
+        cur = conn.execute("SELECT COUNT(*) c FROM trades")
+        rows = _rows(cur)
+    return rows[0]["c"] if rows else 0
 
 
 def wipe_all():
     with get_conn() as conn:
         conn.execute("DELETE FROM trades")
-        conn.execute("DELETE FROM settings")
 
 
-# ---------- Settings helpers ----------
-def get_setting(key: str, default: str = None) -> str:
+# ---------------------------------------------------------------------------
+# Settings: leverage + per-instrument contract sizes (for margin/% return calc)
+# ---------------------------------------------------------------------------
+
+def get_leverage() -> int:
     with get_conn() as conn:
-        cur = conn.execute("SELECT value FROM settings WHERE key = ?", (key,))
-        row = cur.fetchone()
-        if row is None:
-            return default
-        return row["value"]
+        cur = conn.execute("SELECT value FROM settings WHERE key = 'leverage'")
+        rows = _rows(cur)
+    return int(rows[0]["value"]) if rows else DEFAULT_LEVERAGE
 
 
-def set_setting(key: str, value: str):
+def set_leverage(leverage: int):
     with get_conn() as conn:
         conn.execute(
-            "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
-            (key, value)
+            "INSERT INTO settings (key, value) VALUES ('leverage', ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (str(leverage),),
         )
 
 
-def get_leverage() -> float:
-    val = get_setting("leverage", "200")
-    try:
-        return float(val)
-    except ValueError:
-        return 200.0
+def get_contract_sizes() -> dict:
+    """Returns {instrument: contract_size}, seeded with sane defaults on first call."""
+    with get_conn() as conn:
+        cur = conn.execute("SELECT instrument, contract_size FROM contract_sizes")
+        rows = _rows(cur)
+    sizes = {r["instrument"]: r["contract_size"] for r in rows}
+    if not sizes:
+        set_contract_sizes(DEFAULT_CONTRACT_SIZES)
+        return dict(DEFAULT_CONTRACT_SIZES)
+    return sizes
 
 
-def get_contract_size(instrument: str) -> float:
-    key = f"contract_size_{instrument.upper()}"
-    val = get_setting(key, None)
-    if val is None:
-        # default: XAUUSD -> 100, else 1
-        if instrument.upper() == "XAUUSD":
-            return 100.0
-        return 1.0
-    try:
-        return float(val)
-    except ValueError:
-        return 1.0
+def set_contract_sizes(mapping: dict):
+    with get_conn() as conn:
+        for instrument, size in mapping.items():
+            conn.execute(
+                "INSERT INTO contract_sizes (instrument, contract_size) VALUES (?, ?) "
+                "ON CONFLICT(instrument) DO UPDATE SET contract_size = excluded.contract_size",
+                (instrument, float(size)),
+            )
 
 
 def set_contract_size(instrument: str, size: float):
-    key = f"contract_size_{instrument.upper()}"
-    set_setting(key, str(size))
+    set_contract_sizes({instrument: size})
+
+
+def delete_contract_size(instrument: str):
+    with get_conn() as conn:
+        conn.execute("DELETE FROM contract_sizes WHERE instrument = ?", (instrument,))
