@@ -9,6 +9,8 @@ from datetime import datetime
 import numpy as np
 import pandas as pd
 
+from db import get_leverage, get_contract_size
+
 # Columns the broker export uses -> our internal db column names
 BROKER_COLUMN_MAP = {
     "Order Number": "broker_order_id",
@@ -98,6 +100,15 @@ def parse_broker_csv(file_bytes: bytes) -> tuple[pd.DataFrame, str]:
     df["strategy"] = None
     df["tags"] = None
 
+    # The broker's "P/L" column is GROSS — fee/tax/commission/swap are reported
+    # separately (and are already signed, e.g. fee = -3 for a cost). Keep the
+    # gross figure for reference, and store the NET figure as `pnl`, which is
+    # what all analytics in this app are built on.
+    if "pnl" in df.columns:
+        df["gross_pnl"] = df["pnl"]
+        cost_cols = [c for c in ["fee", "tax", "commission", "swap"] if c in df.columns]
+        df["pnl"] = df["gross_pnl"] + df[cost_cols].sum(axis=1)
+
     if "archived" in df.columns:
         df = df.drop(columns=["archived"])
 
@@ -109,6 +120,31 @@ def parse_broker_csv(file_bytes: bytes) -> tuple[pd.DataFrame, str]:
 # Analytics
 # ---------------------------------------------------------------------------
 
+def margin_deployed(row: pd.Series) -> float:
+    """
+    Compute margin (capital deployed) for a single trade row.
+    Uses leverage and contract size from settings.
+    """
+    leverage = get_leverage()
+    instr = row.get("instrument", "").upper()
+    contract_size = get_contract_size(instr)
+    entry = row.get("entry_price", 0.0)
+    lot = row.get("lot_size", 0.0)
+    if leverage <= 0 or entry <= 0 or lot <= 0:
+        return 0.0
+    notional = lot * contract_size * entry
+    return notional / leverage
+
+
+def return_pct(row: pd.Series) -> float:
+    """Return percentage for a single trade: pnl / margin * 100."""
+    margin = margin_deployed(row)
+    pnl = row.get("pnl", 0.0)
+    if margin == 0:
+        return 0.0
+    return (pnl / margin) * 100
+
+
 def compute_kpis(df: pd.DataFrame) -> dict:
     """Core KPI block for the dashboard header."""
     if df.empty:
@@ -118,6 +154,7 @@ def compute_kpis(df: pd.DataFrame) -> dict:
             "expectancy": 0.0, "best_trade": 0.0, "worst_trade": 0.0,
             "max_drawdown": 0.0, "total_fees": 0.0, "avg_rr": 0.0,
             "current_streak": 0, "gross_profit": 0.0, "gross_loss": 0.0,
+            "avg_return_pct": 0.0, "max_return_pct": 0.0, "total_margin_deployed": 0.0,
         }
 
     pnl = df["pnl"]
@@ -157,6 +194,14 @@ def compute_kpis(df: pd.DataFrame) -> dict:
                 break
         streak *= sign
 
+    # ---- New: return % statistics ----
+    # Compute margin and return for each row (caching for speed)
+    margins = df.apply(margin_deployed, axis=1)
+    returns = df.apply(return_pct, axis=1)
+    avg_return = returns.mean() if len(returns) else 0.0
+    max_return = returns.max() if len(returns) else 0.0
+    total_margin = margins.sum()
+
     return {
         "total_pnl": float(pnl.sum()),
         "total_trades": int(len(df)),
@@ -173,6 +218,9 @@ def compute_kpis(df: pd.DataFrame) -> dict:
         "current_streak": int(streak),
         "gross_profit": float(gross_profit),
         "gross_loss": float(gross_loss),
+        "avg_return_pct": float(avg_return),
+        "max_return_pct": float(max_return),
+        "total_margin_deployed": float(total_margin),
     }
 
 
@@ -227,8 +275,59 @@ def pnl_by_hour(df: pd.DataFrame) -> pd.DataFrame:
     return grouped
 
 
-def format_currency(value: float, symbol: str = "\u20b9") -> str:
+def cost_breakdown(df: pd.DataFrame) -> dict:
+    """Total fees/tax/commission/swap paid, plus gross vs net P/L."""
+    if df.empty:
+        return {"fee": 0.0, "tax": 0.0, "commission": 0.0, "swap": 0.0,
+                "total_costs": 0.0, "gross_pnl": 0.0, "net_pnl": 0.0}
+    fee = df.get("fee", pd.Series(dtype=float)).abs().sum()
+    tax = df.get("tax", pd.Series(dtype=float)).abs().sum()
+    commission = df.get("commission", pd.Series(dtype=float)).abs().sum()
+    swap = df.get("swap", pd.Series(dtype=float)).sum()  # swap can be + or -, don't force abs
+    net_pnl = df["pnl"].sum()
+    gross_pnl = df["gross_pnl"].sum() if "gross_pnl" in df.columns else net_pnl
+    total_costs = fee + tax + commission + abs(min(swap, 0))
+    return {
+        "fee": float(fee), "tax": float(tax), "commission": float(commission),
+        "swap": float(swap), "total_costs": float(total_costs),
+        "gross_pnl": float(gross_pnl), "net_pnl": float(net_pnl),
+    }
+
+
+def calendar_month_data(df: pd.DataFrame, year: int, month: int) -> pd.DataFrame:
+    """Daily P/L + trade count for every day in a given month (df must have exit_time)."""
+    if df.empty:
+        return pd.DataFrame(columns=["date", "pnl", "trades"])
+    d = df.copy()
+    d["exit_dt"] = pd.to_datetime(d["exit_time"], errors="coerce")
+    mask = (d["exit_dt"].dt.year == year) & (d["exit_dt"].dt.month == month)
+    d = d[mask]
+    if d.empty:
+        return pd.DataFrame(columns=["date", "pnl", "trades"])
+    d["date"] = d["exit_dt"].dt.date
+    grouped = d.groupby("date").agg(pnl=("pnl", "sum"), trades=("pnl", "count")).reset_index()
+    return grouped
+
+
+def monthly_summary(df: pd.DataFrame) -> pd.DataFrame:
+    """P/L aggregated by calendar month, across all history — for a year-over-year overview."""
+    if df.empty:
+        return pd.DataFrame(columns=["month", "pnl", "trades"])
+    d = df.copy()
+    d["exit_dt"] = pd.to_datetime(d["exit_time"], errors="coerce")
+    d["month"] = d["exit_dt"].dt.to_period("M").astype(str)
+    grouped = d.groupby("month").agg(pnl=("pnl", "sum"), trades=("pnl", "count")).reset_index()
+    return grouped.sort_values("month")
+
+
+def format_currency(value: float, symbol: str = "$") -> str:
     if value is None or (isinstance(value, float) and (np.isnan(value) or np.isinf(value))):
         return "—"
     sign = "-" if value < 0 else ""
     return f"{sign}{symbol}{abs(value):,.2f}"
+
+
+def format_percent(value: float) -> str:
+    if value is None or np.isnan(value) or np.isinf(value):
+        return "—"
+    return f"{value:+.2f}%"
