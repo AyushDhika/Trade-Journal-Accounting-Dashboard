@@ -33,7 +33,8 @@ CREATE TABLE IF NOT EXISTS trades (
     tax                 REAL DEFAULT 0,
     commission          REAL DEFAULT 0,
     swap                REAL DEFAULT 0,
-    pnl                 REAL NOT NULL DEFAULT 0,   -- net P/L
+    pnl                 REAL NOT NULL DEFAULT 0,   -- NET P/L (after fee/tax/commission/swap)
+    gross_pnl           REAL,                       -- P/L before costs (as reported by broker, if known)
     points              REAL,
     strategy             TEXT,
     remarks             TEXT,
@@ -42,6 +43,11 @@ CREATE TABLE IF NOT EXISTS trades (
 );
 CREATE INDEX IF NOT EXISTS idx_trades_exit_time ON trades(exit_time);
 CREATE INDEX IF NOT EXISTS idx_trades_instrument ON trades(instrument);
+
+CREATE TABLE IF NOT EXISTS settings (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
 """
 
 
@@ -59,6 +65,36 @@ def get_conn():
 def init_db():
     with get_conn() as conn:
         conn.executescript(SCHEMA)
+        # Migration: add gross_pnl to dbs created before this column existed
+        cols = {row["name"] for row in conn.execute("PRAGMA table_info(trades)")}
+        if "gross_pnl" not in cols:
+            conn.execute("ALTER TABLE trades ADD COLUMN gross_pnl REAL")
+            conn.execute("UPDATE trades SET gross_pnl = pnl WHERE gross_pnl IS NULL")
+
+        # Correction: earlier versions of the CSV importer stored the broker's
+        # GROSS P/L directly in `pnl` without subtracting fee/tax/commission/swap,
+        # so gross_pnl and pnl ended up identical for rows imported back then.
+        # This recompute is idempotent (safe to run on every boot) and only
+        # touches broker-imported rows, never manual entries.
+        conn.execute("""
+            UPDATE trades
+            SET pnl = ROUND(
+                COALESCE(gross_pnl, pnl)
+                + COALESCE(fee, 0) + COALESCE(tax, 0)
+                + COALESCE(commission, 0) + COALESCE(swap, 0),
+            2)
+            WHERE source = 'csv'
+        """)
+
+        # Set default settings if they don't exist
+        defaults = [
+            ("leverage", "200"),
+            ("contract_size_XAUUSD", "100"),
+        ]
+        for key, val in defaults:
+            cur = conn.execute("SELECT value FROM settings WHERE key = ?", (key,))
+            if cur.fetchone() is None:
+                conn.execute("INSERT INTO settings (key, value) VALUES (?, ?)", (key, val))
 
 
 def insert_manual_trade(trade: dict) -> int:
@@ -162,3 +198,49 @@ def trade_count() -> int:
 def wipe_all():
     with get_conn() as conn:
         conn.execute("DELETE FROM trades")
+        conn.execute("DELETE FROM settings")
+
+
+# ---------- Settings helpers ----------
+def get_setting(key: str, default: str = None) -> str:
+    with get_conn() as conn:
+        cur = conn.execute("SELECT value FROM settings WHERE key = ?", (key,))
+        row = cur.fetchone()
+        if row is None:
+            return default
+        return row["value"]
+
+
+def set_setting(key: str, value: str):
+    with get_conn() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
+            (key, value)
+        )
+
+
+def get_leverage() -> float:
+    val = get_setting("leverage", "200")
+    try:
+        return float(val)
+    except ValueError:
+        return 200.0
+
+
+def get_contract_size(instrument: str) -> float:
+    key = f"contract_size_{instrument.upper()}"
+    val = get_setting(key, None)
+    if val is None:
+        # default: XAUUSD -> 100, else 1
+        if instrument.upper() == "XAUUSD":
+            return 100.0
+        return 1.0
+    try:
+        return float(val)
+    except ValueError:
+        return 1.0
+
+
+def set_contract_size(instrument: str, size: float):
+    key = f"contract_size_{instrument.upper()}"
+    set_setting(key, str(size))
