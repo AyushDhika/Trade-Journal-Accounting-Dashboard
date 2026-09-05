@@ -1,0 +1,38 @@
+name: Keep Trade Journal Awake
+
+on:
+  schedule:
+    # Runs every 6 hours — well under Streamlit Cloud's ~7-day sleep threshold
+    - cron: '0 */6 * * *'
+  workflow_dispatch: {}   # lets you trigger it manually from the Actions tab
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install Playwright (headless browser)
+        run: |
+          pip install playwright
+          playwright install --with-deps chromium
+
+      - name: Wake the app
+        run: |
+          python - <<'PY'
+          from playwright.sync_api import sync_playwright
+
+          APP_URL = "https://trade-journal-accounting-dashboard-mwucjycr2f3sktqgmxrzuf.streamlit.app/"
+
+          with sync_playwright() as p:
+              browser = p.chromium.launch()
+              page = browser.new_page()
+              page.goto(APP_URL, timeout=60000, wait_until="networkidle")
+              # If the app shows a "Yes, get this app back up!" wake button
+              # after sleeping, click it.
+              try:
+                  page.get_by_text("get this app back up", exact=False).click(timeout=5000)
+                  page.wait_for_timeout(15000)
+              except Exception:
+                  pass
+              print("Pinged:", page.title())
+              browser.close()
+          PY
