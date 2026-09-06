@@ -1123,7 +1123,7 @@ elif page == "🔍 Analytics":
             c4.metric("Total Fees Paid", utils.format_currency(k["total_fees"], CURRENCY_SYMBOL))
 
         # =====================================================================
-        # NEW TAB — XAUUSD benchmark (live strip + weekly/monthly/yearly compare)
+        # XAUUSD benchmark tab — live strip + weekly/monthly/yearly comparison
         # =====================================================================
         with tab5:
             st.markdown('<div class="section-title">Live XAUUSD</div>', unsafe_allow_html=True)
@@ -1163,18 +1163,29 @@ elif page == "🔍 Analytics":
                 else:
                     kpi_card("XAUUSD Spot · Live", "—", sub="feed unreachable")
 
+            # ---- Live-strip KPIs: ALL lookups are date-based (never row offsets) ----
             day_chg = day_pct = m1_pct = ytd_pct = None
             if gold_hist is not None and len(gold_hist) >= 2:
                 closes = gold_hist["close"]
+                dates = gold_hist["date"]
                 last_close = float(closes.iloc[-1])
-                prev_close = float(closes.iloc[-2])
                 ref = live["price"] if live else last_close
+
+                # 24h: previous close by DATE (not row offset)
+                prev_rows = gold_hist[dates < dates.iloc[-1]]
+                prev_close = float(prev_rows["close"].iloc[-1]) if len(prev_rows) else last_close
                 day_chg = ref - prev_close
                 day_pct = (day_chg / prev_close) * 100 if prev_close else 0.0
-                lookback = min(21, len(closes) - 1)
-                m1_pct = (ref / float(closes.iloc[-1 - lookback]) - 1) * 100
-                last_year = int(gold_hist["date"].iloc[-1].year)
-                prev_year_rows = gold_hist[gold_hist["date"].dt.year < last_year]
+
+                # 1-month: last close on/before (last bar date - 30 days)
+                target_1m = dates.iloc[-1] - pd.Timedelta(days=30)
+                mask_1m = dates <= target_1m
+                base_1m = float(closes[mask_1m].iloc[-1]) if mask_1m.any() else float(closes.iloc[0])
+                m1_pct = (ref / base_1m - 1) * 100 if base_1m else None
+
+                # YTD: last close of the previous calendar year
+                last_year = int(dates.iloc[-1].year)
+                prev_year_rows = gold_hist[dates.dt.year < last_year]
                 if not prev_year_rows.empty:
                     year_base = float(prev_year_rows["close"].iloc[-1])
                     ytd_pct = (ref / year_base - 1) * 100 if year_base else None
