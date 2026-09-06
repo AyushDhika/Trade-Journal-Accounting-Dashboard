@@ -5,6 +5,7 @@ utils.py — Broker CSV parsing + performance analytics for the Trade Journal.
 import io
 import re
 from datetime import datetime
+from typing import Optional
 
 import numpy as np
 import pandas as pd
@@ -318,6 +319,134 @@ def monthly_summary(df: pd.DataFrame) -> pd.DataFrame:
     d["month"] = d["exit_dt"].dt.to_period("M").astype(str)
     grouped = d.groupby("month").agg(pnl=("pnl", "sum"), trades=("pnl", "count")).reset_index()
     return grouped.sort_values("month")
+
+
+def equity_curve_daily(df: pd.DataFrame) -> pd.DataFrame:
+    """Cumulative P/L reindexed to every calendar day (not just trading days),
+    so it can be plotted against a continuous daily price series like gold."""
+    if df.empty:
+        return pd.DataFrame(columns=["date", "equity"])
+    d = daily_pnl(df)
+    d["date"] = pd.to_datetime(d["date"])
+    d = d.set_index("date").sort_index()
+    full_range = pd.date_range(d.index.min(), d.index.max(), freq="D")
+    d = d.reindex(full_range)
+    d.index.name = "date"
+    d["pnl"] = d["pnl"].fillna(0)
+    d["equity"] = d["pnl"].cumsum()
+    return d.reset_index()[["date", "equity"]]
+
+
+def pnl_by_period(df: pd.DataFrame, freq: str) -> pd.DataFrame:
+    """Net P/L bucketed into weekly ('W'), monthly ('M') or yearly ('Y')
+    periods, keyed by each period's end date so it can be merged against a
+    benchmark series bucketed the same way."""
+    if df.empty:
+        return pd.DataFrame(columns=["period_end", "pnl", "trades"])
+    d = df.copy()
+    d["exit_dt"] = pd.to_datetime(d["exit_time"], errors="coerce")
+    d = d.dropna(subset=["exit_dt"])
+    if d.empty:
+        return pd.DataFrame(columns=["period_end", "pnl", "trades"])
+    grouped = d.groupby(pd.Grouper(key="exit_dt", freq=freq)).agg(
+        pnl=("pnl", "sum"), trades=("pnl", "count")
+    ).reset_index().rename(columns={"exit_dt": "period_end"})
+    return grouped
+
+
+def gold_pct_by_period(gold_df: pd.DataFrame, freq: str) -> pd.DataFrame:
+    """Gold's % price change within each period, using the first and last
+    close price available inside that bucket."""
+    if gold_df.empty:
+        return pd.DataFrame(columns=["period_end", "gold_start", "gold_end", "gold_pct"])
+    g = gold_df.copy().sort_values("date")
+    grouped = g.groupby(pd.Grouper(key="date", freq=freq))["close"].agg(["first", "last"]).reset_index()
+    grouped = grouped.rename(columns={"date": "period_end", "first": "gold_start", "last": "gold_end"})
+    grouped = grouped.dropna(subset=["gold_start", "gold_end"])
+    grouped["gold_pct"] = (grouped["gold_end"] - grouped["gold_start"]) / grouped["gold_start"] * 100
+    return grouped
+
+
+def merge_benchmark(pnl_periods: pd.DataFrame, gold_periods: pd.DataFrame, freq: str) -> pd.DataFrame:
+    """Combine your period P/L with gold's period % move into one table,
+    labeled for display."""
+    merged = pd.merge(pnl_periods, gold_periods, on="period_end", how="outer").sort_values("period_end")
+    merged["pnl"] = merged["pnl"].fillna(0.0)
+    merged["trades"] = merged["trades"].fillna(0).astype(int)
+    if freq == "W":
+        merged["period_label"] = merged["period_end"].dt.strftime("Week of %d %b %Y")
+    elif freq == "M":
+        merged["period_label"] = merged["period_end"].dt.strftime("%b %Y")
+    else:
+        merged["period_label"] = merged["period_end"].dt.strftime("%Y")
+    return merged.reset_index(drop=True)
+
+
+def period_bounds(period_end: pd.Timestamp, freq: str) -> tuple:
+    """Given a period-end timestamp from pnl_by_period/gold_pct_by_period,
+    return (period_start, period_end) as full-day-inclusive timestamps."""
+    period_end = pd.Timestamp(period_end).normalize()
+    if freq == "W":
+        start = period_end - pd.Timedelta(days=6)
+    elif freq == "M":
+        start = period_end.replace(day=1)
+    else:  # "Y"
+        start = period_end.replace(month=1, day=1)
+    end = period_end + pd.Timedelta(hours=23, minutes=59, seconds=59)
+    return start, end
+
+
+def modified_dietz_return(pnl: float, period_start: pd.Timestamp, period_end: pd.Timestamp,
+                           capital_df: pd.DataFrame) -> Optional[float]:
+    """% return for a period accounting for exactly when capital moved in/out
+    during it (Modified Dietz method), so a deposit or withdrawal mid-period
+    doesn't distort the return the way a flat start/end balance would.
+
+    capital_df must have 'date' (datetime) and 'amount' (float, +deposit/-withdrawal).
+    Returns None if there's no capital base to divide by (e.g. nothing logged yet).
+    """
+    if capital_df.empty:
+        return None
+    c = capital_df.copy()
+    c["date"] = pd.to_datetime(c["date"])
+
+    bmv = c.loc[c["date"] < period_start, "amount"].sum()
+    flows = c.loc[(c["date"] >= period_start) & (c["date"] <= period_end)]
+
+    total_seconds = (period_end - period_start).total_seconds()
+    if total_seconds <= 0 or flows.empty:
+        weighted_cf = flows["amount"].sum() if not flows.empty else 0.0
+    else:
+        weights = (period_end - flows["date"]).dt.total_seconds() / total_seconds
+        weighted_cf = (flows["amount"] * weights).sum()
+
+    denom = bmv + weighted_cf
+    if denom == 0:
+        return None
+    return pnl / denom * 100
+
+
+def attach_capital_returns(bench: pd.DataFrame, capital_df: pd.DataFrame, freq: str) -> pd.DataFrame:
+    """Add a 'return_pct' column to a benchmark table (from merge_benchmark),
+    computed via Modified Dietz for each period."""
+    out = bench.copy()
+    if capital_df.empty:
+        out["return_pct"] = None
+        return out
+    returns = []
+    for _, row in out.iterrows():
+        p_start, p_end = period_bounds(row["period_end"], freq)
+        returns.append(modified_dietz_return(row["pnl"], p_start, p_end, capital_df))
+    out["return_pct"] = returns
+    return out
+
+
+def overall_return_pct(total_pnl: float, first_date: pd.Timestamp, last_date: pd.Timestamp,
+                        capital_df: pd.DataFrame) -> Optional[float]:
+    """Since-inception % return via Modified Dietz, for a single headline KPI."""
+    if capital_df.empty or first_date is None or last_date is None:
+        return None
+    return modified_dietz_return(total_pnl, pd.Timestamp(first_date), pd.Timestamp(last_date), capital_df)
 
 
 def format_currency(value: float, symbol: str = "$") -> str:
