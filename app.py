@@ -8,12 +8,13 @@ per-instrument / per-weekday / per-hour breakdowns).
 Run with:  streamlit run app.py
 """
 
-from datetime import datetime, date, time as dtime
+from datetime import datetime, date, time as dtime, timedelta
 
 import pandas as pd
 import plotly.graph_objects as go
 import plotly.express as px
 import streamlit as st
+import yfinance as yf
 
 import db
 import utils
@@ -42,6 +43,28 @@ def _init_db_once():
 _init_db_once()
 
 CURRENCY_SYMBOL = "$"  # USD
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_gold_history(start_date: str, end_date: str) -> pd.DataFrame:
+    """Daily XAUUSD spot close prices from Yahoo Finance, cached for an hour
+    so we don't re-fetch on every Streamlit rerun (this app reruns its whole
+    script on every click/filter change). Needs internet access at runtime —
+    returns an empty DataFrame (never raises) if the fetch fails for any
+    reason, so the caller can show a friendly warning instead of crashing."""
+    try:
+        raw = yf.download("XAUUSD=X", start=start_date, end=end_date,
+                           progress=False, auto_adjust=False)
+        if raw is None or raw.empty:
+            return pd.DataFrame(columns=["date", "close"])
+        if isinstance(raw.columns, pd.MultiIndex):
+            raw.columns = raw.columns.get_level_values(0)
+        out = raw.reset_index()[["Date", "Close"]]
+        out.columns = ["date", "close"]
+        out["date"] = pd.to_datetime(out["date"])
+        return out.dropna(subset=["close"])
+    except Exception:
+        return pd.DataFrame(columns=["date", "close"])
 
 # ---------------------------------------------------------------------------
 # Global CSS — professional trading-terminal look, Apple-grade motion & depth
@@ -109,7 +132,6 @@ st.markdown("""
         padding-top: 1.8rem;
         padding-bottom: 3rem;
         max-width: 1400px;
-        animation: pageIn 0.5s var(--ease) both;
     }
 
     @keyframes pageIn {
@@ -132,9 +154,7 @@ st.markdown("""
         border-radius: 16px;
         padding: 18px 20px;
         height: 100%;
-        animation: fadeInUp 0.55s var(--ease) both;
         transition: transform 0.35s var(--ease), box-shadow 0.35s var(--ease), border-color 0.35s var(--ease);
-        will-change: transform;
     }
     .kpi-card:hover {
         transform: translateY(-4px);
@@ -174,7 +194,6 @@ st.markdown("""
         margin: 6px 0 14px 0;
         padding-left: 10px;
         border-left: 3px solid var(--green);
-        animation: fadeIn 0.5s var(--ease) both;
         letter-spacing: -0.01em;
     }
 
@@ -185,7 +204,6 @@ st.markdown("""
         padding-bottom: 10px;
         margin-bottom: 20px;
         border-bottom: 1px solid var(--border);
-        animation: fadeInUp 0.55s var(--ease) both;
     }
     .app-title {
         font-size: 30px;
@@ -296,12 +314,10 @@ st.markdown("""
     div[data-testid="stDataFrame"], div[data-testid="stDataEditor"] {
         border-radius: 12px;
         overflow: hidden;
-        animation: fadeIn 0.5s var(--ease) both;
     }
 
     /* Plotly charts — gentle reveal */
     div[data-testid="stPlotlyChart"] {
-        animation: fadeInUp 0.6s var(--ease) both;
         border-radius: 12px;
         overflow: hidden;
     }
@@ -455,7 +471,7 @@ with st.sidebar:
 
     page = st.radio(
         "Navigate",
-        ["📊 Dashboard", "📅 Calendar", "➕ Add Trade", "📥 Import CSV", "📜 Trade History", "🔍 Analytics", "⚙️ Settings"],
+        ["📊 Dashboard", "📅 Calendar", "➕ Add Trade", "📥 Import CSV", "💰 Capital", "📜 Trade History", "🔍 Analytics", "⚙️ Settings"],
         label_visibility="collapsed",
     )
 
@@ -473,6 +489,7 @@ PAGE_TITLES = {
     "📅 Calendar": ("Trading Calendar", "Daily P/L at a glance — navigate month to month or pick a date range"),
     "➕ Add Trade": ("Add Trade", "Manually log a closed trade"),
     "📥 Import CSV": ("Import Broker CSV", "Upload your broker's Closed Trades Report to sync trades automatically"),
+    "💰 Capital": ("Capital Ledger", "Log deposits and withdrawals so your returns can be measured as a %, not just $"),
     "📜 Trade History": ("Trade History", "Browse, filter, edit and export every logged trade"),
     "🔍 Analytics": ("Deep Analytics", "Break down performance by instrument, weekday, hour and streaks"),
     "⚙️ Settings": ("Settings", "Preferences and data management"),
@@ -567,6 +584,25 @@ if page == "📊 Dashboard":
             streak = k["current_streak"]
             streak_txt = f"{abs(streak)} {'win' if streak >= 0 else 'loss'}{'es' if abs(streak)!=1 and streak<0 else ('s' if abs(streak)!=1 else '')}"
             kpi_card("Current Streak", streak_txt, positive=(streak >= 0))
+
+        cap_df_dash = db.fetch_capital_transactions()
+        if not cap_df_dash.empty:
+            st.markdown("<div style='height:22px'></div>", unsafe_allow_html=True)
+            st.markdown('<div class="section-title">Capital & Return</div>', unsafe_allow_html=True)
+            first_dt = pd.to_datetime(filtered["exit_time"]).min()
+            last_dt = max(pd.to_datetime(filtered["exit_time"]).max(), pd.Timestamp.now())
+            overall_ret = utils.overall_return_pct(k["total_pnl"], first_dt, last_dt, cap_df_dash)
+            capc1, capc2, capc3 = st.columns(3)
+            with capc1:
+                kpi_card("Current Capital", utils.format_currency(db.current_capital_balance(), CURRENCY_SYMBOL))
+            with capc2:
+                kpi_card("Overall Return %",
+                          utils.format_percent(overall_ret) if overall_ret is not None else "—",
+                          sub="Modified Dietz, since inception", positive=(overall_ret or 0) >= 0)
+            with capc3:
+                net_flow = cap_df_dash["amount"].sum()
+                kpi_card("Net Deposits", utils.format_currency(net_flow, CURRENCY_SYMBOL),
+                          sub="Total deposited minus withdrawn")
 
         st.markdown("<div style='height:22px'></div>", unsafe_allow_html=True)
         st.markdown('<div class="section-title">Costs Breakdown</div>', unsafe_allow_html=True)
@@ -910,6 +946,91 @@ elif page == "📥 Import CSV":
 
 
 # ---------------------------------------------------------------------------
+# PAGE: Capital
+# ---------------------------------------------------------------------------
+elif page == "💰 Capital":
+    st.caption(
+        "Log every deposit or withdrawal here. This lets your P/L be measured as a "
+        "**% return** (via the Modified Dietz method, which accounts for exactly when "
+        "money moved) instead of just a raw $ number — useful since your trading "
+        "capital changes often."
+    )
+
+    bal = db.current_capital_balance()
+    st.markdown(f"""
+        <div class="kpi-card" style="max-width:340px;margin-bottom:20px;">
+            <div class="kpi-label">CURRENT CAPITAL BALANCE</div>
+            <div class="kpi-value">{utils.format_currency(bal, CURRENCY_SYMBOL)}</div>
+            <div class="kpi-sub">Sum of all deposits minus withdrawals logged below</div>
+        </div>
+    """, unsafe_allow_html=True)
+
+    with st.form("capital_tx_form", clear_on_submit=True):
+        st.markdown('<div class="section-title">Log a Deposit or Withdrawal</div>', unsafe_allow_html=True)
+        fc1, fc2, fc3 = st.columns([1, 1, 2])
+        tx_date = fc1.date_input("Date", value=date.today())
+        tx_type = fc2.radio("Type", ["Deposit", "Withdrawal"], horizontal=True)
+        tx_note = fc3.text_input("Note (optional)", placeholder="e.g. moved profits to broker B")
+        tx_amount = st.number_input("Amount", min_value=0.0, step=100.0, format="%.2f")
+        submitted = st.form_submit_button("Add Entry", type="primary")
+        if submitted:
+            if tx_amount <= 0:
+                st.error("Enter an amount greater than 0.")
+            else:
+                signed = tx_amount if tx_type == "Deposit" else -tx_amount
+                db.insert_capital_transaction(
+                    date=datetime.combine(tx_date, dtime.min).isoformat(),
+                    amount=signed,
+                    note=tx_note,
+                )
+                st.success(f"Logged {tx_type.lower()} of {utils.format_currency(tx_amount, CURRENCY_SYMBOL)}.")
+                st.rerun()
+
+    st.markdown("<div style='height:10px'></div>", unsafe_allow_html=True)
+    st.markdown('<div class="section-title">History</div>', unsafe_allow_html=True)
+    cap_df = db.fetch_capital_transactions()
+    if cap_df.empty:
+        st.info("No capital transactions logged yet.")
+    else:
+        display_df = cap_df.copy()
+        display_df["date"] = pd.to_datetime(display_df["date"]).dt.strftime("%Y-%m-%d")
+        display_df["Type"] = display_df["amount"].apply(lambda a: "Deposit" if a >= 0 else "Withdrawal")
+        display_df["Amount"] = display_df["amount"].apply(lambda a: utils.format_currency(abs(a), CURRENCY_SYMBOL))
+        display_df = display_df.rename(columns={"date": "Date", "note": "Note"})
+        st.dataframe(
+            display_df[["id", "Date", "Type", "Amount", "Note"]].sort_values("id", ascending=False),
+            width="stretch", hide_index=True,
+            column_config={"id": "ID"},
+        )
+
+        with st.expander("✏️ Edit or delete an entry"):
+            tx_ids = cap_df["id"].tolist()
+            if tx_ids:
+                sel_id = st.selectbox("Select entry ID", tx_ids)
+                sel_row = cap_df[cap_df["id"] == sel_id].iloc[0]
+                ec1, ec2, ec3 = st.columns([1, 1, 2])
+                new_date = ec1.date_input("Date", value=pd.to_datetime(sel_row["date"]).date(), key="edit_cap_date")
+                new_type = ec2.radio("Type", ["Deposit", "Withdrawal"],
+                                      index=0 if sel_row["amount"] >= 0 else 1,
+                                      horizontal=True, key="edit_cap_type")
+                new_note = ec3.text_input("Note", value=sel_row.get("note", "") or "", key="edit_cap_note")
+                new_amount = st.number_input("Amount", min_value=0.0, value=abs(float(sel_row["amount"])),
+                                              step=100.0, format="%.2f", key="edit_cap_amount")
+                b1, b2 = st.columns(2)
+                if b1.button("Save Changes", type="primary", key="save_cap_edit"):
+                    signed = new_amount if new_type == "Deposit" else -new_amount
+                    db.update_capital_transaction(
+                        int(sel_id), datetime.combine(new_date, dtime.min).isoformat(), signed, new_note
+                    )
+                    st.success("Updated.")
+                    st.rerun()
+                if b2.button("🗑️ Delete Entry", key="delete_cap_entry"):
+                    db.delete_capital_transaction(int(sel_id))
+                    st.success("Deleted.")
+                    st.rerun()
+
+
+# ---------------------------------------------------------------------------
 # PAGE: Trade History
 # ---------------------------------------------------------------------------
 elif page == "📜 Trade History":
@@ -1001,7 +1122,9 @@ elif page == "🔍 Analytics":
         with st.expander("🔎 Filters", expanded=False):
             filtered = apply_filters_ui(all_df, "an")
 
-        tab1, tab2, tab3, tab4 = st.tabs(["By Instrument", "By Weekday", "By Hour", "Distribution"])
+        tab1, tab2, tab3, tab4, tab5 = st.tabs(
+            ["By Instrument", "By Weekday", "By Hour", "Distribution", "🪙 vs Gold"]
+        )
 
         with tab1:
             byinst = utils.pnl_by_instrument(filtered)
@@ -1049,6 +1172,107 @@ elif page == "🔍 Analytics":
             c2.metric("Gross Loss", utils.format_currency(-k["gross_loss"], CURRENCY_SYMBOL))
             c3.metric("Avg R:R", "∞" if k["avg_rr"] == float("inf") else f"{k['avg_rr']:.2f}")
             c4.metric("Total Fees Paid", utils.format_currency(k["total_fees"], CURRENCY_SYMBOL))
+
+        with tab5:
+            st.caption(
+                "Benchmarked against live XAUUSD spot price (Yahoo Finance). "
+                "Your P/L is in raw $ (no starting-capital tracking, since your "
+                "trading capital changes frequently) — gold's move is shown as a %, "
+                "side by side rather than on one shared scale."
+            )
+            bench_source = filtered if not filtered.empty else all_df
+            freq_choice = st.radio(
+                "Period", ["Weekly", "Monthly", "Yearly"], horizontal=True, key="gold_bench_freq"
+            )
+            freq_code = {"Weekly": "W", "Monthly": "M", "Yearly": "Y"}[freq_choice]
+
+            start_d = pd.to_datetime(bench_source["exit_time"]).min().date()
+            end_d = date.today() + timedelta(days=1)
+            gold_df = fetch_gold_history(str(start_d), str(end_d))
+
+            if gold_df.empty:
+                st.warning(
+                    "Couldn't fetch live gold price data right now — this needs internet "
+                    "access to Yahoo Finance at runtime. If you're running locally without "
+                    "internet, or Yahoo is temporarily unreachable, try again shortly."
+                )
+            else:
+                pnl_periods = utils.pnl_by_period(bench_source, freq_code)
+                gold_periods = utils.gold_pct_by_period(gold_df, freq_code)
+                bench = utils.merge_benchmark(pnl_periods, gold_periods, freq_code)
+
+                capital_df = db.fetch_capital_transactions()
+                has_capital = not capital_df.empty
+                if has_capital:
+                    bench = utils.attach_capital_returns(bench, capital_df, freq_code)
+                else:
+                    st.info(
+                        "Log deposits/withdrawals in **💰 Capital** to also see your "
+                        "**% return** here, computed properly even when your capital changes "
+                        "mid-period — right now this only compares raw $ P/L against gold's % move."
+                    )
+
+                fig = go.Figure()
+                bar_colors = [GREEN if v >= 0 else RED for v in bench["pnl"]]
+                fig.add_trace(go.Bar(
+                    x=bench["period_label"], y=bench["pnl"],
+                    name=f"Your P/L ({CURRENCY_SYMBOL})", marker_color=bar_colors, yaxis="y1",
+                ))
+                fig.add_trace(go.Scatter(
+                    x=bench["period_label"], y=bench["gold_pct"],
+                    name="Gold % Move", mode="lines+markers",
+                    line=dict(color=ACCENT, width=2), yaxis="y2",
+                ))
+                if has_capital:
+                    fig.add_trace(go.Scatter(
+                        x=bench["period_label"], y=bench["return_pct"],
+                        name="Your Return % (Modified Dietz)", mode="lines+markers",
+                        line=dict(color="#F59E0B", width=2, dash="dash"), yaxis="y2",
+                    ))
+                fig.update_layout(
+                    template=PLOTLY_TEMPLATE, height=380,
+                    title=f"Your P/L vs Gold Move — {freq_choice}",
+                    yaxis=dict(title=f"Your P/L ({CURRENCY_SYMBOL})"),
+                    yaxis2=dict(title="% Move / Return", overlaying="y", side="right", showgrid=False),
+                    legend=dict(orientation="h", y=1.15, x=0),
+                    barmode="relative",
+                )
+                st.plotly_chart(fig, width="stretch")
+
+                eq = utils.equity_curve_daily(bench_source)
+                gold_cum = gold_df.sort_values("date").copy()
+                gold_cum["cum_pct"] = (gold_cum["close"] / gold_cum["close"].iloc[0] - 1) * 100
+                fig2 = go.Figure()
+                fig2.add_trace(go.Scatter(
+                    x=eq["date"], y=eq["equity"], name=f"Your Cumulative P/L ({CURRENCY_SYMBOL})",
+                    line=dict(color=GREEN, width=2.2), yaxis="y1",
+                ))
+                fig2.add_trace(go.Scatter(
+                    x=gold_cum["date"], y=gold_cum["cum_pct"], name="Gold Cumulative % Return",
+                    line=dict(color=ACCENT, width=2, dash="dot"), yaxis="y2",
+                ))
+                fig2.update_layout(
+                    template=PLOTLY_TEMPLATE, height=380,
+                    title="Cumulative: Your Equity vs Gold",
+                    yaxis=dict(title=f"Your Equity ({CURRENCY_SYMBOL})"),
+                    yaxis2=dict(title="Gold Cumulative % Return", overlaying="y", side="right", showgrid=False),
+                    legend=dict(orientation="h", y=1.15, x=0),
+                )
+                st.plotly_chart(fig2, width="stretch")
+
+                table = bench.copy()
+                table["Your P/L"] = table["pnl"].apply(lambda v: utils.format_currency(v, CURRENCY_SYMBOL))
+                table["Gold Move %"] = table["gold_pct"].apply(
+                    lambda v: utils.format_percent(v) if pd.notna(v) else "—"
+                )
+                table = table.rename(columns={"period_label": "Period", "trades": "Trades"})
+                show_cols = ["Period", "Your P/L", "Trades", "Gold Move %"]
+                if has_capital:
+                    table["Your Return %"] = table["return_pct"].apply(
+                        lambda v: utils.format_percent(v) if pd.notna(v) else "—"
+                    )
+                    show_cols.append("Your Return %")
+                st.dataframe(table[show_cols], width="stretch", hide_index=True)
 
 
 # ---------------------------------------------------------------------------
