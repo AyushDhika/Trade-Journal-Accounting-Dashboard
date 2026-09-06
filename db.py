@@ -255,6 +255,14 @@ def set_contract_size(instrument: str, size: float):
     set_setting(key, str(size))
 
 
+def get_metalprice_api_key() -> str:
+    return get_setting("metalprice_api_key", "") or ""
+
+
+def set_metalprice_api_key(key: str):
+    set_setting("metalprice_api_key", key)
+
+
 # ---------- Capital transactions (deposits / withdrawals) ----------
 def insert_capital_transaction(date: str, amount: float, note: str = "") -> int:
     """date: ISO string. amount: positive = deposit, negative = withdrawal."""
