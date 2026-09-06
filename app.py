@@ -99,17 +99,19 @@ def fetch_gold_history(start_date: str, end_date: str):
     filter change). Tries, in order: your MetalpriceAPI key (if set in
     Settings — bulk historical data, most reliable if your plan supports the
     /timeframe endpoint), then a chain of free Yahoo Finance tickers. Never
-    raises — returns (empty df, None) if every option fails, so the caller
-    can show a friendly warning instead of crashing. Returns (dataframe,
-    source_label)."""
+    raises — returns (empty df, None, error) if every option fails, so the
+    caller can show a friendly warning instead of crashing. Returns
+    (dataframe, source_label, metalprice_error_or_None)."""
+    metalprice_error = None
     api_key = db.get_metalprice_api_key()
     if api_key:
         try:
             df = _fetch_gold_metalpriceapi(api_key, start_date, end_date)
             if not df.empty:
-                return df, "MetalpriceAPI (XAU/USD)"
-        except Exception:
-            pass  # fall through to the free tickers below
+                return df, "MetalpriceAPI (XAU/USD)", None
+            metalprice_error = "MetalpriceAPI returned no data for this date range."
+        except Exception as e:
+            metalprice_error = f"{type(e).__name__}: {e}"
 
     for ticker, label in GOLD_TICKER_CANDIDATES:
         try:
@@ -124,10 +126,10 @@ def fetch_gold_history(start_date: str, end_date: str):
             out["date"] = pd.to_datetime(out["date"])
             out = out.dropna(subset=["close"])
             if not out.empty:
-                return out, label
+                return out, label, metalprice_error
         except Exception:
             continue
-    return pd.DataFrame(columns=["date", "close"]), None
+    return pd.DataFrame(columns=["date", "close"]), None, metalprice_error
 
 # ---------------------------------------------------------------------------
 # Global CSS — professional trading-terminal look, Apple-grade motion & depth
@@ -1252,7 +1254,10 @@ elif page == "🔍 Analytics":
 
             start_d = pd.to_datetime(bench_source["exit_time"]).min().date()
             end_d = date.today() + timedelta(days=1)
-            gold_df, gold_source_label = fetch_gold_history(str(start_d), str(end_d))
+            gold_df, gold_source_label, metalprice_error = fetch_gold_history(str(start_d), str(end_d))
+
+            if metalprice_error:
+                st.warning(f"MetalpriceAPI wasn't used — falling back to Yahoo Finance. Reason: {metalprice_error}")
 
             if gold_df.empty:
                 st.warning(
