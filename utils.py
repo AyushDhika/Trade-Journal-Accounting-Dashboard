@@ -1,7 +1,8 @@
 """
 utils.py — Broker CSV parsing + performance analytics for the Trade Journal.
 Also hosts the XAUUSD market-data layer (live spot + daily history) with
-multi-source fallback, and the P/L-vs-Gold benchmark builder.
+multi-source fallback + bar-frequency validation, and the P/L-vs-Gold
+benchmark builder (merge_asof based, robust to gaps).
 """
 import io
 import json
@@ -334,10 +335,12 @@ def format_percent(value: float) -> str:
 # XAUUSD market data — free, key-less sources with automatic fallback
 #
 #   Live spot : gold-api.com  ->  Yahoo GC=F (front-month COMEX futures)
-#   History   : stooq.com     ->  stooq.pl  ->  Yahoo GC=F chart API
+#   History   : stooq.com -> stooq.pl -> Yahoo GC=F (10y daily)
 #
-# GC=F tracks spot within a few dollars; % moves are virtually identical,
-# which is all the benchmark uses.
+# Every history source is validated: if the median gap between bars is not
+# ~1 day (e.g. Yahoo sometimes downgrades range=max to MONTHLY bars, which
+# produced the bogus "+77% in a month" reading), the source is rejected and
+# the next one is tried.
 # ===========================================================================
 GOLD_LIVE_URLS = [
     "https://api.gold-api.com/price/XAU",
@@ -351,8 +354,8 @@ GOLD_HISTORY_STOOQ_URLS = [
     "https://stooq.pl/q/d/l/?s=xauusd&i=d",
 ]
 GOLD_HISTORY_YAHOO_URLS = [
-    "https://query1.finance.yahoo.com/v8/finance/chart/GC=F?range=max&interval=1d",
-    "https://query2.finance.yahoo.com/v8/finance/chart/GC=F?range=max&interval=1d",
+    "https://query1.finance.yahoo.com/v8/finance/chart/GC=F?range=10y&interval=1d",
+    "https://query2.finance.yahoo.com/v8/finance/chart/GC=F?range=10y&interval=1d",
 ]
 
 PERIOD_FREQ = {"Weekly": "W", "Monthly": "M", "Yearly": "Y"}
@@ -378,6 +381,23 @@ def _source_name(url: str) -> str:
         return url.split("//", 1)[1].split("/", 1)[0]
     except Exception:
         return url
+
+
+def _validate_daily(df: pd.DataFrame) -> pd.DataFrame:
+    """Reject payloads that are not genuinely daily bars."""
+    if df is None or len(df) < 30:
+        raise ValueError("too few rows to be a daily history")
+    recent = df.tail(500)
+    gaps = recent["date"].diff().dt.days.dropna()
+    if gaps.empty:
+        raise ValueError("cannot determine bar frequency")
+    median_gap = float(gaps.median())
+    if median_gap > 3.5:
+        raise ValueError(
+            f"coarse interval detected (median gap {median_gap:.0f}d — expected ~1d); "
+            "source downgraded to non-daily bars, rejecting"
+        )
+    return df
 
 
 # ----- live price sources --------------------------------------------------
@@ -436,7 +456,7 @@ def _gold_history_stooq(url: str) -> pd.DataFrame:
     df = df.dropna(subset=["date", "close"]).sort_values("date").reset_index(drop=True)
     if df.empty:
         raise ValueError("empty history")
-    return df
+    return _validate_daily(df)
 
 
 def _gold_history_yahoo(url: str) -> pd.DataFrame:
@@ -466,13 +486,13 @@ def _gold_history_yahoo(url: str) -> pd.DataFrame:
             .sort_values("date").reset_index(drop=True))
     if df.empty:
         raise ValueError("all rows dropped")
-    return df
+    return _validate_daily(df)
 
 
 def fetch_gold_history() -> pd.DataFrame:
     """
     Daily XAUUSD OHLC history. Tries every source in order and returns the
-    first one that yields valid rows. Columns: date, open, high, low, close.
+    first one that yields valid DAILY rows. Columns: date, open, high, low, close.
     """
     errors = []
     sources = ([(u, _gold_history_stooq) for u in GOLD_HISTORY_STOOQ_URLS]
@@ -505,7 +525,12 @@ def build_benchmark(trades_df: pd.DataFrame, gold_df: pd.DataFrame,
     Align trade P/L with gold price movement in Weekly/Monthly/Yearly buckets.
     One row per period that contains at least one trade:
       period, period_label, trades, net_pnl, gold_close, gold_pct
-    gold_pct = % change of that period's gold close vs previous period's close.
+
+    gold_close = last daily gold close on/before the period's end date
+    gold_pct   = that close vs the close on/before the PREVIOUS period's end
+
+    Uses merge_asof (date-based lookup) instead of groupby-join, so every
+    trade period gets a correct gold value even if the bar series has gaps.
     """
     cols = ["period", "period_label", "trades", "net_pnl", "gold_close", "gold_pct"]
     if trades_df is None or trades_df.empty or gold_df is None or gold_df.empty:
@@ -520,12 +545,32 @@ def build_benchmark(trades_df: pd.DataFrame, gold_df: pd.DataFrame,
     t["period"] = t["exit_dt"].dt.to_period(freq)
     agg = t.groupby("period").agg(net_pnl=("pnl", "sum"), trades=("pnl", "count"))
 
-    g = gold_df.copy()
-    g["period"] = g["date"].dt.to_period(freq)
-    gold_per = g.groupby("period").agg(gold_close=("close", "last"))
-    gold_per["gold_pct"] = gold_per["gold_close"].pct_change() * 100
+    g = gold_df[["date", "close"]].dropna().sort_values("date")
 
-    out = agg.join(gold_per, how="left").reset_index()
-    out = out.sort_values("period").reset_index(drop=True)
+    periods = list(agg.index)
+    ends = [p.end_time for p in periods]
+    prev_ends = [(p - 1).end_time for p in periods]
+
+    stamps = sorted(set(ends) | set(prev_ends))
+    need = pd.DataFrame({"ts": stamps})
+    merged = pd.merge_asof(
+        need, g, left_on="ts", right_on="date",
+        direction="backward", tolerance=pd.Timedelta(days=45),
+    )
+    close_at = dict(zip(merged["ts"], merged["close"]))
+
+    out = agg.reset_index()
+    gold_close = [close_at.get(e) for e in ends]
+    prev_close = [close_at.get(e) for e in prev_ends]
+
+    def _pct(c, p):
+        if c is None or p is None:
+            return None
+        if pd.isna(c) or pd.isna(p) or not p:
+            return None
+        return (float(c) / float(p) - 1) * 100
+
+    out["gold_close"] = [None if (v is None or pd.isna(v)) else float(v) for v in gold_close]
+    out["gold_pct"] = [_pct(c, p) for c, p in zip(gold_close, prev_close)]
     out["period_label"] = out["period"].map(lambda p: _period_label(p, freq))
     return out[cols]
