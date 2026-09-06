@@ -1,11 +1,12 @@
 """
 utils.py — Broker CSV parsing + performance analytics for the Trade Journal.
+Also hosts the XAUUSD market-data fetchers (live spot + daily history)
+and the P/L-vs-Gold benchmark builder.
 """
-
 import io
-import re
+import json
+import urllib.request
 from datetime import datetime
-from typing import Optional
 
 import numpy as np
 import pandas as pd
@@ -34,7 +35,7 @@ BROKER_COLUMN_MAP = {
 }
 
 NUMERIC_COLS = ["lot_size", "entry_price", "exit_price", "fee", "tax",
-                 "commission", "swap", "pnl", "points"]
+                "commission", "swap", "pnl", "points"]
 
 
 class CSVFormatError(Exception):
@@ -46,7 +47,6 @@ def parse_broker_csv(file_bytes: bytes) -> tuple[pd.DataFrame, str]:
     Parses the broker 'Closed Trades Report' CSV export.
     The file has a free-text title line before the real header, so we
     locate the header row dynamically rather than assuming line 2.
-
     Returns (dataframe ready for db insert, report_title)
     """
     text = file_bytes.decode("utf-8-sig", errors="replace")
@@ -120,12 +120,8 @@ def parse_broker_csv(file_bytes: bytes) -> tuple[pd.DataFrame, str]:
 # ---------------------------------------------------------------------------
 # Analytics
 # ---------------------------------------------------------------------------
-
 def margin_deployed(row: pd.Series) -> float:
-    """
-    Compute margin (capital deployed) for a single trade row.
-    Uses leverage and contract size from settings.
-    """
+    """Compute margin (capital deployed) for a single trade row."""
     leverage = get_leverage()
     instr = row.get("instrument", "").upper()
     contract_size = get_contract_size(instr)
@@ -163,14 +159,12 @@ def compute_kpis(df: pd.DataFrame) -> dict:
     losses = pnl[pnl < 0]
     gross_profit = wins.sum()
     gross_loss = abs(losses.sum())
-
     win_rate = (len(wins) / len(pnl) * 100) if len(pnl) else 0.0
     profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else np.inf
     avg_win = wins.mean() if len(wins) else 0.0
     avg_loss = losses.mean() if len(losses) else 0.0
     expectancy = pnl.mean() if len(pnl) else 0.0
     avg_rr = abs(avg_win / avg_loss) if avg_loss != 0 else np.inf
-
     total_fees = (
         df.get("fee", pd.Series(dtype=float)).abs().sum()
         + df.get("commission", pd.Series(dtype=float)).abs().sum()
@@ -195,8 +189,7 @@ def compute_kpis(df: pd.DataFrame) -> dict:
                 break
         streak *= sign
 
-    # ---- New: return % statistics ----
-    # Compute margin and return for each row (caching for speed)
+    # Return % statistics
     margins = df.apply(margin_deployed, axis=1)
     returns = df.apply(return_pct, axis=1)
     avg_return = returns.mean() if len(returns) else 0.0
@@ -263,7 +256,10 @@ def pnl_by_weekday(df: pd.DataFrame) -> pd.DataFrame:
     d = df.copy()
     d["weekday"] = pd.to_datetime(d["exit_time"]).dt.day_name()
     order = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
-    grouped = d.groupby("weekday").agg(pnl=("pnl", "sum"), trades=("pnl", "count")).reindex(order).dropna(how="all").reset_index()
+    grouped = (
+        d.groupby("weekday").agg(pnl=("pnl", "sum"), trades=("pnl", "count"))
+        .reindex(order).dropna(how="all").reset_index()
+    )
     return grouped
 
 
@@ -284,7 +280,7 @@ def cost_breakdown(df: pd.DataFrame) -> dict:
     fee = df.get("fee", pd.Series(dtype=float)).abs().sum()
     tax = df.get("tax", pd.Series(dtype=float)).abs().sum()
     commission = df.get("commission", pd.Series(dtype=float)).abs().sum()
-    swap = df.get("swap", pd.Series(dtype=float)).sum()  # swap can be + or -, don't force abs
+    swap = df.get("swap", pd.Series(dtype=float)).sum()  # swap can be + or -
     net_pnl = df["pnl"].sum()
     gross_pnl = df["gross_pnl"].sum() if "gross_pnl" in df.columns else net_pnl
     total_costs = fee + tax + commission + abs(min(swap, 0))
@@ -296,7 +292,7 @@ def cost_breakdown(df: pd.DataFrame) -> dict:
 
 
 def calendar_month_data(df: pd.DataFrame, year: int, month: int) -> pd.DataFrame:
-    """Daily P/L + trade count for every day in a given month (df must have exit_time)."""
+    """Daily P/L + trade count for every day in a given month."""
     if df.empty:
         return pd.DataFrame(columns=["date", "pnl", "trades"])
     d = df.copy()
@@ -311,7 +307,7 @@ def calendar_month_data(df: pd.DataFrame, year: int, month: int) -> pd.DataFrame
 
 
 def monthly_summary(df: pd.DataFrame) -> pd.DataFrame:
-    """P/L aggregated by calendar month, across all history — for a year-over-year overview."""
+    """P/L aggregated by calendar month, across all history."""
     if df.empty:
         return pd.DataFrame(columns=["month", "pnl", "trades"])
     d = df.copy()
@@ -319,134 +315,6 @@ def monthly_summary(df: pd.DataFrame) -> pd.DataFrame:
     d["month"] = d["exit_dt"].dt.to_period("M").astype(str)
     grouped = d.groupby("month").agg(pnl=("pnl", "sum"), trades=("pnl", "count")).reset_index()
     return grouped.sort_values("month")
-
-
-def equity_curve_daily(df: pd.DataFrame) -> pd.DataFrame:
-    """Cumulative P/L reindexed to every calendar day (not just trading days),
-    so it can be plotted against a continuous daily price series like gold."""
-    if df.empty:
-        return pd.DataFrame(columns=["date", "equity"])
-    d = daily_pnl(df)
-    d["date"] = pd.to_datetime(d["date"])
-    d = d.set_index("date").sort_index()
-    full_range = pd.date_range(d.index.min(), d.index.max(), freq="D")
-    d = d.reindex(full_range)
-    d.index.name = "date"
-    d["pnl"] = d["pnl"].fillna(0)
-    d["equity"] = d["pnl"].cumsum()
-    return d.reset_index()[["date", "equity"]]
-
-
-def pnl_by_period(df: pd.DataFrame, freq: str) -> pd.DataFrame:
-    """Net P/L bucketed into weekly ('W'), monthly ('M') or yearly ('Y')
-    periods, keyed by each period's end date so it can be merged against a
-    benchmark series bucketed the same way."""
-    if df.empty:
-        return pd.DataFrame(columns=["period_end", "pnl", "trades"])
-    d = df.copy()
-    d["exit_dt"] = pd.to_datetime(d["exit_time"], errors="coerce")
-    d = d.dropna(subset=["exit_dt"])
-    if d.empty:
-        return pd.DataFrame(columns=["period_end", "pnl", "trades"])
-    grouped = d.groupby(pd.Grouper(key="exit_dt", freq=freq)).agg(
-        pnl=("pnl", "sum"), trades=("pnl", "count")
-    ).reset_index().rename(columns={"exit_dt": "period_end"})
-    return grouped
-
-
-def gold_pct_by_period(gold_df: pd.DataFrame, freq: str) -> pd.DataFrame:
-    """Gold's % price change within each period, using the first and last
-    close price available inside that bucket."""
-    if gold_df.empty:
-        return pd.DataFrame(columns=["period_end", "gold_start", "gold_end", "gold_pct"])
-    g = gold_df.copy().sort_values("date")
-    grouped = g.groupby(pd.Grouper(key="date", freq=freq))["close"].agg(["first", "last"]).reset_index()
-    grouped = grouped.rename(columns={"date": "period_end", "first": "gold_start", "last": "gold_end"})
-    grouped = grouped.dropna(subset=["gold_start", "gold_end"])
-    grouped["gold_pct"] = (grouped["gold_end"] - grouped["gold_start"]) / grouped["gold_start"] * 100
-    return grouped
-
-
-def merge_benchmark(pnl_periods: pd.DataFrame, gold_periods: pd.DataFrame, freq: str) -> pd.DataFrame:
-    """Combine your period P/L with gold's period % move into one table,
-    labeled for display."""
-    merged = pd.merge(pnl_periods, gold_periods, on="period_end", how="outer").sort_values("period_end")
-    merged["pnl"] = merged["pnl"].fillna(0.0)
-    merged["trades"] = merged["trades"].fillna(0).astype(int)
-    if freq == "W":
-        merged["period_label"] = merged["period_end"].dt.strftime("Week of %d %b %Y")
-    elif freq == "M":
-        merged["period_label"] = merged["period_end"].dt.strftime("%b %Y")
-    else:
-        merged["period_label"] = merged["period_end"].dt.strftime("%Y")
-    return merged.reset_index(drop=True)
-
-
-def period_bounds(period_end: pd.Timestamp, freq: str) -> tuple:
-    """Given a period-end timestamp from pnl_by_period/gold_pct_by_period,
-    return (period_start, period_end) as full-day-inclusive timestamps."""
-    period_end = pd.Timestamp(period_end).normalize()
-    if freq == "W":
-        start = period_end - pd.Timedelta(days=6)
-    elif freq == "M":
-        start = period_end.replace(day=1)
-    else:  # "Y"
-        start = period_end.replace(month=1, day=1)
-    end = period_end + pd.Timedelta(hours=23, minutes=59, seconds=59)
-    return start, end
-
-
-def modified_dietz_return(pnl: float, period_start: pd.Timestamp, period_end: pd.Timestamp,
-                           capital_df: pd.DataFrame) -> Optional[float]:
-    """% return for a period accounting for exactly when capital moved in/out
-    during it (Modified Dietz method), so a deposit or withdrawal mid-period
-    doesn't distort the return the way a flat start/end balance would.
-
-    capital_df must have 'date' (datetime) and 'amount' (float, +deposit/-withdrawal).
-    Returns None if there's no capital base to divide by (e.g. nothing logged yet).
-    """
-    if capital_df.empty:
-        return None
-    c = capital_df.copy()
-    c["date"] = pd.to_datetime(c["date"])
-
-    bmv = c.loc[c["date"] < period_start, "amount"].sum()
-    flows = c.loc[(c["date"] >= period_start) & (c["date"] <= period_end)]
-
-    total_seconds = (period_end - period_start).total_seconds()
-    if total_seconds <= 0 or flows.empty:
-        weighted_cf = flows["amount"].sum() if not flows.empty else 0.0
-    else:
-        weights = (period_end - flows["date"]).dt.total_seconds() / total_seconds
-        weighted_cf = (flows["amount"] * weights).sum()
-
-    denom = bmv + weighted_cf
-    if denom == 0:
-        return None
-    return pnl / denom * 100
-
-
-def attach_capital_returns(bench: pd.DataFrame, capital_df: pd.DataFrame, freq: str) -> pd.DataFrame:
-    """Add a 'return_pct' column to a benchmark table (from merge_benchmark),
-    computed via Modified Dietz for each period."""
-    out = bench.copy()
-    if capital_df.empty:
-        out["return_pct"] = None
-        return out
-    returns = []
-    for _, row in out.iterrows():
-        p_start, p_end = period_bounds(row["period_end"], freq)
-        returns.append(modified_dietz_return(row["pnl"], p_start, p_end, capital_df))
-    out["return_pct"] = returns
-    return out
-
-
-def overall_return_pct(total_pnl: float, first_date: pd.Timestamp, last_date: pd.Timestamp,
-                        capital_df: pd.DataFrame) -> Optional[float]:
-    """Since-inception % return via Modified Dietz, for a single headline KPI."""
-    if capital_df.empty or first_date is None or last_date is None:
-        return None
-    return modified_dietz_return(total_pnl, pd.Timestamp(first_date), pd.Timestamp(last_date), capital_df)
 
 
 def format_currency(value: float, symbol: str = "$") -> str:
@@ -460,3 +328,109 @@ def format_percent(value: float) -> str:
     if value is None or np.isnan(value) or np.isinf(value):
         return "—"
     return f"{value:+.2f}%"
+
+
+# ---------------------------------------------------------------------------
+# XAUUSD market data — free endpoints, no API key, no extra dependency
+# ---------------------------------------------------------------------------
+GOLD_LIVE_URL = "https://api.gold-api.com/price/XAU"      # live spot (JSON)
+GOLD_HISTORY_URL = "https://stooq.com/q/d/l/?s=xauusd&i=d"  # daily OHLC (CSV)
+
+PERIOD_FREQ = {"Weekly": "W", "Monthly": "M", "Yearly": "Y"}
+
+
+class GoldDataError(Exception):
+    pass
+
+
+def _http_get(url: str, timeout: int = 20) -> bytes:
+    req = urllib.request.Request(
+        url, headers={"User-Agent": "Mozilla/5.0 (TradeJournal/1.0)"}
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return resp.read()
+
+
+def fetch_gold_live() -> dict:
+    """Live XAUUSD spot price. Returns {'price': float, 'updated_at': str}."""
+    try:
+        payload = json.loads(_http_get(GOLD_LIVE_URL).decode("utf-8"))
+        price = float(payload.get("price"))
+        if price <= 0:
+            raise ValueError("bad price payload")
+        return {
+            "price": price,
+            "updated_at": payload.get("updatedAt") or payload.get("createdAt") or "",
+        }
+    except Exception as exc:
+        raise GoldDataError(f"live gold price unavailable ({exc})") from exc
+
+
+def fetch_gold_history() -> pd.DataFrame:
+    """Full daily XAUUSD OHLC history from Stooq (free CSV, no key)."""
+    try:
+        text = _http_get(GOLD_HISTORY_URL).decode("utf-8")
+        first_line = text.splitlines()[0] if text.strip() else ""
+        if "Date" not in first_line:
+            raise ValueError("unexpected payload (possibly rate-limited)")
+        df = pd.read_csv(io.StringIO(text))
+        df.columns = [str(c).strip().lower() for c in df.columns]
+        required = {"date", "open", "high", "low", "close"}
+        if not required.issubset(df.columns):
+            raise ValueError(f"missing columns: {sorted(required - set(df.columns))}")
+        df["date"] = pd.to_datetime(df["date"], errors="coerce")
+        for col in ("open", "high", "low", "close"):
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+        df = df.dropna(subset=["date", "close"]).sort_values("date").reset_index(drop=True)
+        if df.empty:
+            raise ValueError("empty history")
+        return df
+    except GoldDataError:
+        raise
+    except Exception as exc:
+        raise GoldDataError(f"XAUUSD history unavailable ({exc})") from exc
+
+
+def _period_label(period, freq: str) -> str:
+    if freq == "W":
+        return period.start_time.strftime("%d %b %y")
+    if freq == "M":
+        return period.strftime("%b %Y")
+    if freq == "Y":
+        return str(period.year)
+    return str(period)
+
+
+def build_benchmark(trades_df: pd.DataFrame, gold_df: pd.DataFrame,
+                    freq: str = "M") -> pd.DataFrame:
+    """
+    Align trade P/L with gold price movement in Weekly/Monthly/Yearly buckets.
+
+    Returns one row per period that contains at least one trade:
+      period, period_label, trades, net_pnl, gold_close, gold_pct
+
+    gold_close = last daily gold close inside that period.
+    gold_pct   = % change of that close vs the PREVIOUS period's close.
+    """
+    cols = ["period", "period_label", "trades", "net_pnl", "gold_close", "gold_pct"]
+    if trades_df is None or trades_df.empty or gold_df is None or gold_df.empty:
+        return pd.DataFrame(columns=cols)
+
+    t = trades_df.copy()
+    t["exit_dt"] = pd.to_datetime(t["exit_time"], errors="coerce")
+    t = t.dropna(subset=["exit_dt"])
+    if t.empty:
+        return pd.DataFrame(columns=cols)
+
+    t["period"] = t["exit_dt"].dt.to_period(freq)
+    agg = t.groupby("period").agg(net_pnl=("pnl", "sum"), trades=("pnl", "count"))
+
+    g = gold_df.copy()
+    g["period"] = g["date"].dt.to_period(freq)
+    gold_per = g.groupby("period").agg(gold_close=("close", "last"))
+    gold_per["gold_pct"] = gold_per["gold_close"].pct_change() * 100
+
+    out = agg.join(gold_per, how="left").reset_index()
+    out = out.sort_values("period").reset_index(drop=True)
+    out["period_label"] = out["period"].map(lambda p: _period_label(p, freq))
+    return out[cols]
