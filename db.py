@@ -48,6 +48,15 @@ CREATE TABLE IF NOT EXISTS settings (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS capital_transactions (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    date        TEXT NOT NULL,        -- ISO 8601 date/time of the deposit or withdrawal
+    amount      REAL NOT NULL,        -- positive = deposit, negative = withdrawal
+    note        TEXT,
+    created_at  TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_capital_date ON capital_transactions(date);
 """
 
 
@@ -244,3 +253,41 @@ def get_contract_size(instrument: str) -> float:
 def set_contract_size(instrument: str, size: float):
     key = f"contract_size_{instrument.upper()}"
     set_setting(key, str(size))
+
+
+# ---------- Capital transactions (deposits / withdrawals) ----------
+def insert_capital_transaction(date: str, amount: float, note: str = "") -> int:
+    """date: ISO string. amount: positive = deposit, negative = withdrawal."""
+    with get_conn() as conn:
+        cur = conn.execute(
+            "INSERT INTO capital_transactions (date, amount, note, created_at) VALUES (?, ?, ?, ?)",
+            (date, amount, note, datetime.utcnow().isoformat()),
+        )
+        return cur.lastrowid
+
+
+def update_capital_transaction(tx_id: int, date: str, amount: float, note: str = ""):
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE capital_transactions SET date = ?, amount = ?, note = ? WHERE id = ?",
+            (date, amount, note, tx_id),
+        )
+
+
+def delete_capital_transaction(tx_id: int):
+    with get_conn() as conn:
+        conn.execute("DELETE FROM capital_transactions WHERE id = ?", (tx_id,))
+
+
+def fetch_capital_transactions() -> pd.DataFrame:
+    with get_conn() as conn:
+        df = pd.read_sql_query(
+            "SELECT * FROM capital_transactions ORDER BY date ASC", conn
+        )
+    return df
+
+
+def current_capital_balance() -> float:
+    with get_conn() as conn:
+        row = conn.execute("SELECT COALESCE(SUM(amount), 0) AS bal FROM capital_transactions").fetchone()
+        return float(row["bal"])
