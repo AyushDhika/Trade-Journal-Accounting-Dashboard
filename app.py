@@ -78,28 +78,18 @@ st.markdown("""
     #MainMenu {visibility: hidden;}
     footer {visibility: hidden;}
 
-    /* IMPORTANT: don't hide <header> entirely — on phones/narrow windows the
-       sidebar-open button lives inside it, and hiding the whole element was
-       trapping mobile users with no way to reach the nav. Only hide the
-       deploy/menu toolbar and the colored decoration line instead. */
+    /* IMPORTANT: do NOT hide <header> or its toolbar. The sidebar's
+       open/close button lives somewhere inside that region, and its exact
+       DOM testid varies by Streamlit version — hiding the container risks
+       hiding that button with no way to ever reopen the sidebar again.
+       Only cosmetic change: make the header bar blend into the background. */
     header[data-testid="stHeader"] { background: transparent; }
-    div[data-testid="stToolbar"] { visibility: hidden; }
-    div[data-testid="stDecoration"] { visibility: hidden; }
-    button[data-testid="stBaseButton-headerNoPadding"],
-    button[data-testid="stSidebarCollapsedControl"],
-    div[data-testid="collapsedControl"],
-    div[data-testid="stSidebarCollapsedControl"] {
-        visibility: visible !important;
-        opacity: 1 !important;
-        z-index: 999999 !important;
-    }
 
     html { scroll-behavior: smooth; }
 
     /* Prevent the page from ever scrolling sideways on small screens —
-       the #1 cause of an "unreadable"/broken-looking layout on phones. */
+       a common cause of an "unreadable"/broken-looking layout on phones. */
     html, body { overflow-x: hidden; }
-    * { box-sizing: border-box; }
 
     /* Ambient background glow — fixed, subtle, non-interactive depth */
     .stApp {
