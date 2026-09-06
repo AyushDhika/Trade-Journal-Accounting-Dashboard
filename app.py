@@ -13,6 +13,7 @@ from datetime import datetime, date, time as dtime, timedelta
 import pandas as pd
 import plotly.graph_objects as go
 import plotly.express as px
+import requests
 import streamlit as st
 import yfinance as yf
 
@@ -44,12 +45,6 @@ _init_db_once()
 
 CURRENCY_SYMBOL = "$"  # USD
 
-# Yahoo's XAUUSD=X spot ticker is unreliable (regionally gated, often returns
-# nothing at all). GC=F (COMEX Gold Futures) tracks spot gold closely enough
-# for % comparisons and is Yahoo's most reliable gold ticker; GLD (an ETF
-# holding physical gold) is a final fallback if futures data is unavailable —
-# its % moves track spot gold almost exactly even though its price level is a
-# fraction of gold's, which doesn't matter since we only ever use % change.
 GOLD_TICKER_CANDIDATES = [
     ("GC=F", "COMEX Gold Futures"),
     ("XAUUSD=X", "XAUUSD Spot"),
@@ -57,15 +52,65 @@ GOLD_TICKER_CANDIDATES = [
 ]
 
 
+def _fetch_gold_metalpriceapi(api_key: str, start_date: str, end_date: str) -> pd.DataFrame:
+    """MetalpriceAPI's /timeframe endpoint, chunked to <=365 days per call
+    (their documented per-request limit). Raises on any failure so the
+    caller can fall back to the free yfinance chain."""
+    frames = []
+    cur_start = pd.Timestamp(start_date)
+    end_ts = pd.Timestamp(end_date)
+    while cur_start <= end_ts:
+        chunk_end = min(cur_start + pd.Timedelta(days=364), end_ts)
+        resp = requests.get(
+            "https://api.metalpriceapi.com/v1/timeframe",
+            params={
+                "api_key": api_key,
+                "start_date": cur_start.strftime("%Y-%m-%d"),
+                "end_date": chunk_end.strftime("%Y-%m-%d"),
+                "base": "XAU",
+                "currencies": "USD",
+            },
+            timeout=15,
+        )
+        data = resp.json()
+        if not data.get("success", False):
+            raise RuntimeError(data.get("error", {}).get("info", "MetalpriceAPI request failed"))
+        for d, vals in data.get("rates", {}).items():
+            price = vals.get("USD")
+            if price is None:
+                continue
+            price = float(price)
+            # Some providers/plans return USD-per-ounce, others the inverse
+            # (ounces-per-USD, a tiny number) depending on base/currency
+            # convention — this guards against getting the inverted one.
+            if price < 1:
+                price = 1 / price
+            frames.append({"date": pd.to_datetime(d), "close": price})
+        cur_start = chunk_end + pd.Timedelta(days=1)
+    if not frames:
+        return pd.DataFrame(columns=["date", "close"])
+    return pd.DataFrame(frames).drop_duplicates(subset="date").sort_values("date")
+
+
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_gold_history(start_date: str, end_date: str):
-    """Daily gold price history from Yahoo Finance, cached for an hour so we
-    don't re-fetch on every Streamlit rerun (this app reruns its whole script
-    on every click/filter change). Tries a few tickers in order of
-    reliability and returns whichever one actually has data. Needs internet
-    access at runtime — returns an empty DataFrame (never raises) if every
-    candidate fails, so the caller can show a friendly warning instead of
-    crashing. Returns (dataframe, ticker_used_label)."""
+    """Daily gold price history, cached for an hour so we don't re-fetch on
+    every Streamlit rerun (this app reruns its whole script on every click/
+    filter change). Tries, in order: your MetalpriceAPI key (if set in
+    Settings — bulk historical data, most reliable if your plan supports the
+    /timeframe endpoint), then a chain of free Yahoo Finance tickers. Never
+    raises — returns (empty df, None) if every option fails, so the caller
+    can show a friendly warning instead of crashing. Returns (dataframe,
+    source_label)."""
+    api_key = db.get_metalprice_api_key()
+    if api_key:
+        try:
+            df = _fetch_gold_metalpriceapi(api_key, start_date, end_date)
+            if not df.empty:
+                return df, "MetalpriceAPI (XAU/USD)"
+        except Exception:
+            pass  # fall through to the free tickers below
+
     for ticker, label in GOLD_TICKER_CANDIDATES:
         try:
             raw = yf.download(ticker, start=start_date, end=end_date,
@@ -1193,8 +1238,8 @@ elif page == "🔍 Analytics":
 
         with tab5:
             st.caption(
-                "Benchmarked against gold price data (Yahoo Finance — tries COMEX futures "
-                "first, falls back to spot/ETF if unavailable). "
+                "Benchmarked against gold price data — uses your MetalpriceAPI key if set "
+                "in **⚙️ Settings**, otherwise falls back to free Yahoo Finance tickers. "
                 "Your P/L is in raw $ (no starting-capital tracking, since your "
                 "trading capital changes frequently) — gold's move is shown as a %, "
                 "side by side rather than on one shared scale."
@@ -1211,13 +1256,13 @@ elif page == "🔍 Analytics":
 
             if gold_df.empty:
                 st.warning(
-                    "Couldn't fetch live gold price data right now — this needs internet "
-                    "access to Yahoo Finance at runtime, and tried COMEX futures, spot, and "
-                    "the GLD ETF as fallbacks. If you're running locally without internet, "
-                    "or Yahoo is temporarily unreachable, try again shortly."
+                    "Couldn't fetch gold price data right now — tried your MetalpriceAPI key "
+                    "(if set) and the free Yahoo Finance fallbacks (COMEX futures, spot, GLD "
+                    "ETF). Check your API key in Settings, or your internet access if running "
+                    "locally, and try again."
                 )
             else:
-                st.caption(f"Gold data source: **{gold_source_label}** (via Yahoo Finance)")
+                st.caption(f"Gold data source: **{gold_source_label}**")
                 pnl_periods = utils.pnl_by_period(bench_source, freq_code)
                 gold_periods = utils.gold_pct_by_period(gold_df, freq_code)
                 bench = utils.merge_benchmark(pnl_periods, gold_periods, freq_code)
@@ -1360,6 +1405,28 @@ elif page == "⚙️ Settings":
                 db.set_contract_size(new_instr, default_size)
             st.success("Settings saved.")
             st.rerun()
+
+    st.markdown("<div style='height:10px'></div>", unsafe_allow_html=True)
+    st.markdown('<div class="section-title">🪙 Gold Benchmark Data Source</div>', unsafe_allow_html=True)
+    st.caption(
+        "Optional. Adding a free [MetalpriceAPI](https://metalpriceapi.com/) key gets you "
+        "bulk historical gold prices in one request. Leave blank and the 🔍 Analytics → "
+        "vs Gold tab falls back to free Yahoo Finance tickers automatically — it works "
+        "either way, this just makes the primary source more reliable."
+    )
+    with st.form("gold_api_form"):
+        current_key = db.get_metalprice_api_key()
+        new_key = st.text_input("MetalpriceAPI Key", value=current_key, type="password",
+                                 placeholder="paste your free API key here")
+        save_key = st.form_submit_button("Save API Key", type="primary")
+        if save_key:
+            db.set_metalprice_api_key(new_key.strip())
+            fetch_gold_history.clear()
+            st.success("Saved. Gold price cache cleared, so the next visit to the vs Gold tab re-fetches.")
+            st.rerun()
+    if st.button("🔄 Clear gold price cache now"):
+        fetch_gold_history.clear()
+        st.success("Cache cleared.")
 
     st.markdown("<div style='height:10px'></div>", unsafe_allow_html=True)
     st.markdown('<div class="section-title">⚠️ Danger Zone</div>', unsafe_allow_html=True)
