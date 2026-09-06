@@ -1,7 +1,7 @@
 """
 utils.py — Broker CSV parsing + performance analytics for the Trade Journal.
-Also hosts the XAUUSD market-data fetchers (live spot + daily history)
-and the P/L-vs-Gold benchmark builder.
+Also hosts the XAUUSD market-data layer (live spot + daily history) with
+multi-source fallback, and the P/L-vs-Gold benchmark builder.
 """
 import io
 import json
@@ -330,11 +330,30 @@ def format_percent(value: float) -> str:
     return f"{value:+.2f}%"
 
 
-# ---------------------------------------------------------------------------
-# XAUUSD market data — free endpoints, no API key, no extra dependency
-# ---------------------------------------------------------------------------
-GOLD_LIVE_URL = "https://api.gold-api.com/price/XAU"      # live spot (JSON)
-GOLD_HISTORY_URL = "https://stooq.com/q/d/l/?s=xauusd&i=d"  # daily OHLC (CSV)
+# ===========================================================================
+# XAUUSD market data — free, key-less sources with automatic fallback
+#
+#   Live spot : gold-api.com  ->  Yahoo GC=F (front-month COMEX futures)
+#   History   : stooq.com     ->  stooq.pl  ->  Yahoo GC=F chart API
+#
+# GC=F tracks spot within a few dollars; % moves are virtually identical,
+# which is all the benchmark uses.
+# ===========================================================================
+GOLD_LIVE_URLS = [
+    "https://api.gold-api.com/price/XAU",
+]
+GOLD_YAHOO_LIVE_URLS = [
+    "https://query1.finance.yahoo.com/v8/finance/chart/GC=F?range=1d&interval=1m",
+    "https://query2.finance.yahoo.com/v8/finance/chart/GC=F?range=1d&interval=1m",
+]
+GOLD_HISTORY_STOOQ_URLS = [
+    "https://stooq.com/q/d/l/?s=xauusd&i=d",
+    "https://stooq.pl/q/d/l/?s=xauusd&i=d",
+]
+GOLD_HISTORY_YAHOO_URLS = [
+    "https://query1.finance.yahoo.com/v8/finance/chart/GC=F?range=max&interval=1d",
+    "https://query2.finance.yahoo.com/v8/finance/chart/GC=F?range=max&interval=1d",
+]
 
 PERIOD_FREQ = {"Weekly": "W", "Monthly": "M", "Yearly": "Y"}
 
@@ -343,54 +362,133 @@ class GoldDataError(Exception):
     pass
 
 
-def _http_get(url: str, timeout: int = 20) -> bytes:
-    req = urllib.request.Request(
-        url, headers={"User-Agent": "Mozilla/5.0 (TradeJournal/1.0)"}
-    )
+def _http_get(url: str, timeout: int = 12) -> bytes:
+    req = urllib.request.Request(url, headers={
+        "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                       "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"),
+        "Accept": "*/*",
+        "Accept-Language": "en-US,en;q=0.9",
+    })
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return resp.read()
 
 
-def fetch_gold_live() -> dict:
-    """Live XAUUSD spot price. Returns {'price': float, 'updated_at': str}."""
+def _source_name(url: str) -> str:
     try:
-        payload = json.loads(_http_get(GOLD_LIVE_URL).decode("utf-8"))
-        price = float(payload.get("price"))
-        if price <= 0:
-            raise ValueError("bad price payload")
-        return {
-            "price": price,
-            "updated_at": payload.get("updatedAt") or payload.get("createdAt") or "",
-        }
-    except Exception as exc:
-        raise GoldDataError(f"live gold price unavailable ({exc})") from exc
+        return url.split("//", 1)[1].split("/", 1)[0]
+    except Exception:
+        return url
+
+
+# ----- live price sources --------------------------------------------------
+def _gold_live_goldapi(url: str) -> dict:
+    payload = json.loads(_http_get(url).decode("utf-8"))
+    price = float(payload.get("price"))
+    if price <= 0:
+        raise ValueError("bad price payload")
+    return {
+        "price": price,
+        "updated_at": payload.get("updatedAt") or payload.get("createdAt") or "",
+    }
+
+
+def _gold_live_yahoo(url: str) -> dict:
+    payload = json.loads(_http_get(url).decode("utf-8"))
+    results = (payload.get("chart") or {}).get("result") or []
+    if not results:
+        raise ValueError("empty chart result")
+    meta = results[0].get("meta") or {}
+    price = float(meta.get("regularMarketPrice") or 0)
+    if price <= 0:
+        raise ValueError("no regularMarketPrice in meta")
+    ts = meta.get("regularMarketTime")
+    updated = datetime.utcfromtimestamp(ts).strftime("%Y-%m-%d %H:%M UTC") if ts else ""
+    return {"price": price, "updated_at": updated}
+
+
+def fetch_gold_live() -> dict:
+    """Live XAUUSD price, trying each source in order. {'price','updated_at'}"""
+    errors = []
+    sources = ([(u, _gold_live_goldapi) for u in GOLD_LIVE_URLS]
+               + [(u, _gold_live_yahoo) for u in GOLD_YAHOO_LIVE_URLS])
+    for url, fetcher in sources:
+        try:
+            return fetcher(url)
+        except Exception as exc:
+            errors.append(f"{_source_name(url)}: {exc}")
+    raise GoldDataError("live gold price unavailable — " + " | ".join(errors))
+
+
+# ----- history sources -------------------------------------------------------
+def _gold_history_stooq(url: str) -> pd.DataFrame:
+    text = _http_get(url).decode("utf-8", errors="replace")
+    lines = text.splitlines()
+    if not lines or "Date" not in lines[0]:
+        raise ValueError("unexpected payload (rate-limited or blocked)")
+    df = pd.read_csv(io.StringIO(text))
+    df.columns = [str(c).strip().lower() for c in df.columns]
+    required = {"date", "open", "high", "low", "close"}
+    if not required.issubset(df.columns):
+        raise ValueError(f"missing columns: {sorted(required - set(df.columns))}")
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    for col in ("open", "high", "low", "close"):
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    df = df.dropna(subset=["date", "close"]).sort_values("date").reset_index(drop=True)
+    if df.empty:
+        raise ValueError("empty history")
+    return df
+
+
+def _gold_history_yahoo(url: str) -> pd.DataFrame:
+    payload = json.loads(_http_get(url).decode("utf-8"))
+    chart = payload.get("chart") or {}
+    results = chart.get("result") or []
+    if not results:
+        err = chart.get("error") or {}
+        raise ValueError(err.get("description", "empty chart result"))
+    res = results[0]
+    ts = res.get("timestamp") or []
+    quote = ((res.get("indicators") or {}).get("quote") or [{}])[0]
+    closes = quote.get("close") or []
+    if len(ts) == 0 or len(closes) == 0:
+        raise ValueError("no rows in chart result")
+    df = pd.DataFrame({
+        "date": pd.to_datetime(ts, unit="s", utc=True).tz_localize(None).normalize(),
+        "open": quote.get("open"),
+        "high": quote.get("high"),
+        "low": quote.get("low"),
+        "close": closes,
+    })
+    for col in ("open", "high", "low", "close"):
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    df = (df.dropna(subset=["date", "close"])
+            .drop_duplicates(subset=["date"], keep="last")
+            .sort_values("date").reset_index(drop=True))
+    if df.empty:
+        raise ValueError("all rows dropped")
+    return df
 
 
 def fetch_gold_history() -> pd.DataFrame:
-    """Full daily XAUUSD OHLC history from Stooq (free CSV, no key)."""
-    try:
-        text = _http_get(GOLD_HISTORY_URL).decode("utf-8")
-        first_line = text.splitlines()[0] if text.strip() else ""
-        if "Date" not in first_line:
-            raise ValueError("unexpected payload (possibly rate-limited)")
-        df = pd.read_csv(io.StringIO(text))
-        df.columns = [str(c).strip().lower() for c in df.columns]
-        required = {"date", "open", "high", "low", "close"}
-        if not required.issubset(df.columns):
-            raise ValueError(f"missing columns: {sorted(required - set(df.columns))}")
-        df["date"] = pd.to_datetime(df["date"], errors="coerce")
-        for col in ("open", "high", "low", "close"):
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-        df = df.dropna(subset=["date", "close"]).sort_values("date").reset_index(drop=True)
-        if df.empty:
-            raise ValueError("empty history")
-        return df
-    except GoldDataError:
-        raise
-    except Exception as exc:
-        raise GoldDataError(f"XAUUSD history unavailable ({exc})") from exc
+    """
+    Daily XAUUSD OHLC history. Tries every source in order and returns the
+    first one that yields valid rows. Columns: date, open, high, low, close.
+    """
+    errors = []
+    sources = ([(u, _gold_history_stooq) for u in GOLD_HISTORY_STOOQ_URLS]
+               + [(u, _gold_history_yahoo) for u in GOLD_HISTORY_YAHOO_URLS])
+    for url, fetcher in sources:
+        try:
+            df = fetcher(url)
+            if df is not None and not df.empty:
+                return df
+            errors.append(f"{_source_name(url)}: empty result")
+        except Exception as exc:
+            errors.append(f"{_source_name(url)}: {exc}")
+    raise GoldDataError("all history sources failed — " + " | ".join(errors))
 
 
+# ----- benchmark builder ------------------------------------------------------
 def _period_label(period, freq: str) -> str:
     if freq == "W":
         return period.start_time.strftime("%d %b %y")
@@ -405,12 +503,9 @@ def build_benchmark(trades_df: pd.DataFrame, gold_df: pd.DataFrame,
                     freq: str = "M") -> pd.DataFrame:
     """
     Align trade P/L with gold price movement in Weekly/Monthly/Yearly buckets.
-
-    Returns one row per period that contains at least one trade:
+    One row per period that contains at least one trade:
       period, period_label, trades, net_pnl, gold_close, gold_pct
-
-    gold_close = last daily gold close inside that period.
-    gold_pct   = % change of that close vs the PREVIOUS period's close.
+    gold_pct = % change of that period's gold close vs previous period's close.
     """
     cols = ["period", "period_label", "trades", "net_pnl", "gold_close", "gold_pct"]
     if trades_df is None or trades_df.empty or gold_df is None or gold_df.empty:
