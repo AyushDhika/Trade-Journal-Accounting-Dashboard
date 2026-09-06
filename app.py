@@ -7,11 +7,11 @@ per-instrument / per-weekday / per-hour breakdowns) and a XAUUSD benchmark tab.
 Run with:  streamlit run app.py
 """
 import calendar as cal_module
+import time
 from datetime import datetime, date, time as dtime
 
 import pandas as pd
 import plotly.graph_objects as go
-import plotly.express as px
 from plotly.subplots import make_subplots
 import streamlit as st
 
@@ -1061,7 +1061,7 @@ elif page == "📜 Trade History":
         )
 
 # ---------------------------------------------------------------------------
-# PAGE: Analytics  (+ new 🥇 vs-Gold benchmark tab)
+# PAGE: Analytics  (includes 🥇 vs-Gold benchmark tab)
 # ---------------------------------------------------------------------------
 elif page == "🔍 Analytics":
     all_df = db.fetch_trades()
@@ -1128,16 +1128,33 @@ elif page == "🔍 Analytics":
         with tab5:
             st.markdown('<div class="section-title">Live XAUUSD</div>', unsafe_allow_html=True)
 
+            now_ts = time.time()
+
+            # Live spot — skip refetch for 30s after a total failure (negative cache)
             live, live_err = None, None
+            if now_ts - st.session_state.get("_gold_live_fail_ts", 0) > 30:
+                try:
+                    live = gold_live_cached()
+                    st.session_state.pop("_gold_live_fail_ts", None)
+                except utils.GoldDataError as exc:
+                    live_err = str(exc)
+                    st.session_state["_gold_live_fail_ts"] = now_ts
+                    st.session_state["_gold_live_fail_msg"] = live_err
+            else:
+                live_err = st.session_state.get("_gold_live_fail_msg", "live feed unreachable")
+
+            # Daily history — skip refetch for 90s after a total failure (negative cache)
             gold_hist, hist_err = None, None
-            try:
-                live = gold_live_cached()
-            except utils.GoldDataError as exc:
-                live_err = str(exc)
-            try:
-                gold_hist = gold_history_cached()
-            except utils.GoldDataError as exc:
-                hist_err = str(exc)
+            if now_ts - st.session_state.get("_gold_hist_fail_ts", 0) > 90:
+                try:
+                    gold_hist = gold_history_cached()
+                    st.session_state.pop("_gold_hist_fail_ts", None)
+                except utils.GoldDataError as exc:
+                    hist_err = str(exc)
+                    st.session_state["_gold_hist_fail_ts"] = now_ts
+                    st.session_state["_gold_hist_fail_msg"] = hist_err
+            else:
+                hist_err = st.session_state.get("_gold_hist_fail_msg", "gold history unreachable")
 
             lc1, lc2, lc3, lc4 = st.columns(4)
             with lc1:
@@ -1175,17 +1192,24 @@ elif page == "🔍 Analytics":
                 kpi_card("YTD Move", "—" if ytd_pct is None else f"{ytd_pct:+.2f}%",
                          positive=None if ytd_pct is None else (ytd_pct >= 0))
 
+            if hist_err or live_err:
+                rb1, rb2 = st.columns([5, 1])
+                with rb2:
+                    if st.button("↻ Retry feeds", key="retry_gold"):
+                        gold_history_cached.clear()
+                        gold_live_cached.clear()
+                        for _k in ("_gold_hist_fail_ts", "_gold_live_fail_ts",
+                                   "_gold_hist_fail_msg", "_gold_live_fail_msg"):
+                            st.session_state.pop(_k, None)
+                        st.rerun()
+
             if gold_hist is not None:
                 stamp = [f"daily bars through {gold_hist['date'].iloc[-1].strftime('%d %b %Y')}"]
                 if live and live.get("updated_at"):
                     stamp.append(f"live updated {live['updated_at']}")
-                st.caption(" · ".join(stamp) + " · sources: gold-api.com (spot) + stooq.com (history)")
+                st.caption(" · ".join(stamp) + " · sources: gold-api.com + stooq.com + Yahoo GC=F (auto-fallback)")
             else:
                 st.warning(f"Gold history unavailable — {hist_err or 'unknown error'}")
-                if st.button("↻ Retry gold data fetch", key="retry_gold"):
-                    gold_history_cached.clear()
-                    gold_live_cached.clear()
-                    st.rerun()
 
             if live_err:
                 st.caption(f"⚠️ Live feed: {live_err} — benchmark below still uses daily history when available.")
@@ -1202,7 +1226,7 @@ elif page == "🔍 Analytics":
                                        horizontal=True, key="bench_scope")
 
             if gold_hist is None:
-                st.info("Benchmark charts need XAUUSD history — fix the connection and hit **Retry** above.")
+                st.info("Benchmark charts need XAUUSD history — fix the connection and hit **↻ Retry feeds** above.")
             else:
                 scope_df = (filtered[filtered["instrument"].str.upper() == "XAUUSD"]
                             if bench_scope == "XAUUSD trades only" else filtered)
