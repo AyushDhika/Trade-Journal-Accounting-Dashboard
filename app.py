@@ -28,7 +28,18 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-db.init_db()
+@st.cache_resource
+def _init_db_once():
+    """Run schema creation + one-time migrations exactly once per server
+    process, instead of on every widget interaction (Streamlit reruns this
+    whole script top-to-bottom on every click/input). Re-running the
+    migration UPDATE on every rerun was pure wasted work and made the app
+    feel sluggish, which is most noticeable on mobile connections."""
+    db.init_db()
+    return True
+
+
+_init_db_once()
 
 CURRENCY_SYMBOL = "$"  # USD
 
@@ -66,9 +77,29 @@ st.markdown("""
 
     #MainMenu {visibility: hidden;}
     footer {visibility: hidden;}
-    header {visibility: hidden;}
+
+    /* IMPORTANT: don't hide <header> entirely — on phones/narrow windows the
+       sidebar-open button lives inside it, and hiding the whole element was
+       trapping mobile users with no way to reach the nav. Only hide the
+       deploy/menu toolbar and the colored decoration line instead. */
+    header[data-testid="stHeader"] { background: transparent; }
+    div[data-testid="stToolbar"] { visibility: hidden; }
+    div[data-testid="stDecoration"] { visibility: hidden; }
+    button[data-testid="stBaseButton-headerNoPadding"],
+    button[data-testid="stSidebarCollapsedControl"],
+    div[data-testid="collapsedControl"],
+    div[data-testid="stSidebarCollapsedControl"] {
+        visibility: visible !important;
+        opacity: 1 !important;
+        z-index: 999999 !important;
+    }
 
     html { scroll-behavior: smooth; }
+
+    /* Prevent the page from ever scrolling sideways on small screens —
+       the #1 cause of an "unreadable"/broken-looking layout on phones. */
+    html, body { overflow-x: hidden; }
+    * { box-sizing: border-box; }
 
     /* Ambient background glow — fixed, subtle, non-interactive depth */
     .stApp {
@@ -289,6 +320,96 @@ st.markdown("""
     div[data-testid="stRadio"] > div { gap: 4px; }
 
     hr { border-color: #1D242C !important; }
+
+    /* ---------------------------------------------------------------
+       Calendar grid — classes instead of inline styles so it can be
+       restyled per breakpoint below.
+    --------------------------------------------------------------- */
+    .cal-grid { display: grid; grid-template-columns: repeat(7, 1fr); gap: 6px; }
+    .cal-grid-header { margin-bottom: 2px; }
+    .cal-header {
+        text-align: center; font-size: 11px; font-weight: 600;
+        color: var(--text-faint); padding: 4px;
+    }
+    .cal-cell {
+        background: var(--card); border: 1px solid var(--border);
+        border-radius: 8px; min-height: 74px; padding: 8px;
+        overflow: hidden;
+    }
+    .cal-cell-empty { background: transparent; border-color: transparent; }
+    .cal-cell-win { background: rgba(34,197,94,0.14); border-color: rgba(34,197,94,0.4); }
+    .cal-cell-loss { background: rgba(239,68,68,0.14); border-color: rgba(239,68,68,0.4); }
+    .cal-cell-today { box-shadow: inset 0 0 0 1.5px var(--blue); }
+    .cal-day-num { font-size: 12px; color: var(--text-dim); font-weight: 600; }
+    .cal-pnl {
+        font-family: 'JetBrains Mono', monospace; font-size: 12px; font-weight: 700;
+        white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    }
+    .cal-pnl-win { color: var(--green); }
+    .cal-pnl-loss { color: var(--red); }
+    .cal-pnl-flat { color: var(--text-dim); font-weight: 400; }
+    .cal-trades { font-size: 10px; color: var(--text-faint); margin-top: 2px; }
+
+    /* ---------------------------------------------------------------
+       RESPONSIVE — tablets and small desktop windows
+    --------------------------------------------------------------- */
+    @media (max-width: 900px) {
+        .block-container { padding-left: 1.2rem !important; padding-right: 1.2rem !important; }
+        .app-title { font-size: 24px; }
+        .kpi-value { font-size: 22px; }
+    }
+
+    /* ---------------------------------------------------------------
+       RESPONSIVE — phones / narrow windows
+    --------------------------------------------------------------- */
+    @media (max-width: 640px) {
+        .block-container {
+            padding-left: 0.75rem !important;
+            padding-right: 0.75rem !important;
+            padding-top: 1rem !important;
+        }
+
+        /* Header */
+        .app-header { flex-wrap: wrap; gap: 4px; padding-bottom: 8px; margin-bottom: 14px; }
+        .app-title { font-size: 20px; letter-spacing: -0.01em; }
+        .app-subtitle { font-size: 12px; line-height: 1.4; }
+
+        /* KPI cards: keep them compact and never let long numbers overflow */
+        .kpi-card { padding: 12px 14px; border-radius: 12px; }
+        .kpi-label { font-size: 10px; letter-spacing: 0.05em; margin-bottom: 4px; }
+        .kpi-value { font-size: 19px; word-break: break-word; }
+        .kpi-sub { font-size: 10.5px; }
+
+        .section-title { font-size: 14.5px; margin: 4px 0 10px 0; padding-left: 8px; }
+
+        /* Tabs: allow horizontal scroll instead of squashing labels */
+        .stTabs [data-baseweb="tab-list"] {
+            overflow-x: auto; flex-wrap: nowrap; -webkit-overflow-scrolling: touch;
+        }
+        .stTabs [data-baseweb="tab"] { padding: 7px 12px; font-size: 12.5px; white-space: nowrap; }
+
+        /* Metrics */
+        div[data-testid="stMetric"] { padding: 10px 12px; }
+        div[data-testid="stMetricValue"] { font-size: 20px; }
+
+        /* Calendar: shrink cells so the 7-column grid still fits a phone */
+        .cal-grid { gap: 3px; }
+        .cal-cell { min-height: 52px; padding: 4px; border-radius: 6px; }
+        .cal-header { font-size: 8.5px; padding: 2px; }
+        .cal-day-num { font-size: 9.5px; }
+        .cal-pnl { font-size: 8.5px; }
+        .cal-trades { display: none; }  /* too cramped at this width, P/L color still tells the story */
+
+        /* Sidebar */
+        section[data-testid="stSidebar"] div[data-testid="stRadio"] label { font-size: 13.5px; }
+    }
+
+    @media (max-width: 400px) {
+        .app-title { font-size: 18px; }
+        .kpi-value { font-size: 17px; }
+        .cal-cell { min-height: 44px; }
+        .cal-pnl { font-size: 7.5px; }
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -489,7 +610,7 @@ if page == "📊 Dashboard":
         ))
         fig.update_layout(template=PLOTLY_TEMPLATE, height=340,
                            xaxis_title="Trade #", yaxis_title=f"Cumulative P/L ({CURRENCY_SYMBOL})")
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
 
         cL, cR = st.columns(2)
         with cL:
@@ -499,7 +620,7 @@ if page == "📊 Dashboard":
             fig2 = go.Figure(go.Bar(x=dpnl["date"].astype(str), y=dpnl["pnl"], marker_color=colors,
                                      hovertemplate="%{x}<br>P/L: " + CURRENCY_SYMBOL + "%{y:,.2f}<extra></extra>"))
             fig2.update_layout(template=PLOTLY_TEMPLATE, height=300)
-            st.plotly_chart(fig2, use_container_width=True)
+            st.plotly_chart(fig2, width="stretch")
         with cR:
             st.markdown('<div class="section-title">P/L by Instrument</div>', unsafe_allow_html=True)
             byinst = utils.pnl_by_instrument(filtered)
@@ -507,7 +628,7 @@ if page == "📊 Dashboard":
             fig3 = go.Figure(go.Bar(x=byinst["instrument"], y=byinst["pnl"], marker_color=colors2,
                                      hovertemplate="%{x}<br>P/L: " + CURRENCY_SYMBOL + "%{y:,.2f}<extra></extra>"))
             fig3.update_layout(template=PLOTLY_TEMPLATE, height=300)
-            st.plotly_chart(fig3, use_container_width=True)
+            st.plotly_chart(fig3, width="stretch")
 
         # --- NEW: Return on Capital KPI row ---
         st.markdown("<div style='height:22px'></div>", unsafe_allow_html=True)
@@ -534,7 +655,7 @@ if page == "📊 Dashboard":
                 "lot_size": "Lot", "entry_price": "Entry", "exit_price": "Exit",
                 "pnl": "P/L", "remarks": "Remarks",
             }),
-            use_container_width=True, hide_index=True,
+            width="stretch", hide_index=True,
         )
 
 
@@ -560,13 +681,13 @@ elif page == "📅 Calendar":
 
             nav1, nav2, nav3 = st.columns([1, 3, 1])
             with nav1:
-                if st.button("← Prev", use_container_width=True):
+                if st.button("← Prev", width="stretch"):
                     m, y = st.session_state.cal_month - 1, st.session_state.cal_year
                     if m == 0:
                         m, y = 12, y - 1
                     st.session_state.cal_month, st.session_state.cal_year = m, y
             with nav3:
-                if st.button("Next →", use_container_width=True):
+                if st.button("Next →", width="stretch"):
                     m, y = st.session_state.cal_month + 1, st.session_state.cal_year
                     if m == 13:
                         m, y = 1, y + 1
@@ -597,39 +718,38 @@ elif page == "📅 Calendar":
             month_matrix = cal_module.monthcalendar(year, month)
 
             weekday_labels = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
-            header_html = "".join(f"<div style='text-align:center;font-size:11px;font-weight:600;color:#6B7885;padding:4px;'>{w}</div>" for w in weekday_labels)
+            header_html = "".join(f"<div class='cal-header'>{w}</div>" for w in weekday_labels)
 
             rows_html = ""
             for week in month_matrix:
                 for day in week:
                     if day == 0:
-                        rows_html += "<div style='background:transparent;border-radius:8px;min-height:74px;'></div>"
+                        rows_html += "<div class='cal-cell cal-cell-empty'></div>"
                         continue
                     d = date(year, month, day)
                     pnl_val, trades_val = pnl_by_day.get(d, (None, 0))
                     if pnl_val is None:
-                        bg, border, pnl_txt = "#141B22", "#1D242C", ""
+                        cell_cls, pnl_txt = "", ""
                     elif pnl_val > 0:
-                        bg, border = "rgba(34,197,94,0.14)", "rgba(34,197,94,0.4)"
-                        pnl_txt = f"<div style='color:#22C55E;font-family:JetBrains Mono,monospace;font-size:12px;font-weight:700;'>+{utils.format_currency(pnl_val, CURRENCY_SYMBOL)}</div>"
+                        cell_cls = "cal-cell-win"
+                        pnl_txt = f"<div class='cal-pnl cal-pnl-win'>+{utils.format_currency(pnl_val, CURRENCY_SYMBOL)}</div>"
                     elif pnl_val < 0:
-                        bg, border = "rgba(239,68,68,0.14)", "rgba(239,68,68,0.4)"
-                        pnl_txt = f"<div style='color:#EF4444;font-family:JetBrains Mono,monospace;font-size:12px;font-weight:700;'>{utils.format_currency(pnl_val, CURRENCY_SYMBOL)}</div>"
+                        cell_cls = "cal-cell-loss"
+                        pnl_txt = f"<div class='cal-pnl cal-pnl-loss'>{utils.format_currency(pnl_val, CURRENCY_SYMBOL)}</div>"
                     else:
-                        bg, border, pnl_txt = "#141B22", "#1D242C", "<div style='color:#8B98A5;font-size:12px;'>—</div>"
-                    trades_txt = f"<div style='color:#6B7885;font-size:10px;margin-top:2px;'>{trades_val} trade{'s' if trades_val != 1 else ''}</div>" if trades_val else ""
-                    is_today = " box-shadow: inset 0 0 0 1.5px #3B82F6;" if d == date.today() else ""
+                        cell_cls, pnl_txt = "", "<div class='cal-pnl cal-pnl-flat'>—</div>"
+                    trades_txt = f"<div class='cal-trades'>{trades_val} trade{'s' if trades_val != 1 else ''}</div>" if trades_val else ""
+                    today_cls = " cal-cell-today" if d == date.today() else ""
                     rows_html += (
-                        f'<div style="background:{bg};border:1px solid {border};'
-                        f'border-radius:8px;min-height:74px;padding:8px;{is_today}">'
-                        f"<div style='font-size:12px;color:#8B98A5;font-weight:600;'>{day}</div>"
+                        f'<div class="cal-cell {cell_cls}{today_cls}">'
+                        f"<div class='cal-day-num'>{day}</div>"
                         f"{pnl_txt}{trades_txt}</div>"
                     )
 
             calendar_html = (
-                '<div style="display:grid;grid-template-columns:repeat(7,1fr);gap:6px;margin-bottom:2px;">'
+                '<div class="cal-grid cal-grid-header">'
                 f'{header_html}</div>'
-                '<div style="display:grid;grid-template-columns:repeat(7,1fr);gap:6px;">'
+                '<div class="cal-grid">'
                 f'{rows_html}</div>'
             )
             st.markdown(calendar_html, unsafe_allow_html=True)
@@ -641,7 +761,7 @@ elif page == "📅 Calendar":
             fig = go.Figure(go.Bar(x=msum["month"], y=msum["pnl"], marker_color=colors,
                                     hovertemplate="%{x}<br>P/L: " + CURRENCY_SYMBOL + "%{y:,.2f}<extra></extra>"))
             fig.update_layout(template=PLOTLY_TEMPLATE, height=280)
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width="stretch")
 
         else:
             c1, c2 = st.columns(2)
@@ -666,11 +786,11 @@ elif page == "📅 Calendar":
             fig = go.Figure(go.Bar(x=dpnl["date"].astype(str), y=dpnl["pnl"], marker_color=colors,
                                     hovertemplate="%{x}<br>P/L: " + CURRENCY_SYMBOL + "%{y:,.2f}<extra></extra>"))
             fig.update_layout(template=PLOTLY_TEMPLATE, height=340, title="P/L by Day")
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width="stretch")
 
             st.dataframe(
                 dpnl.rename(columns={"date": "Date", "pnl": "P/L", "trades": "Trades"}),
-                use_container_width=True, hide_index=True,
+                width="stretch", hide_index=True,
             )
 
 
@@ -710,7 +830,7 @@ elif page == "➕ Add Trade":
                                           help="Leave as 0 to auto-calculate from entry/exit × lot size × side.")
 
         remarks = st.text_area("Remarks / Notes", placeholder="Trade rationale, mistakes, lessons...")
-        submitted = st.form_submit_button("💾 Save Trade", use_container_width=True, type="primary")
+        submitted = st.form_submit_button("💾 Save Trade", width="stretch", type="primary")
 
         if submitted:
             if not instrument.strip():
@@ -779,7 +899,7 @@ elif page == "📥 Import CSV":
             preview_cols = ["broker_order_id", "instrument", "side", "lot_size",
                              "entry_price", "exit_price", "exit_time", "pnl", "remarks"]
             preview_cols = [c for c in preview_cols if c in parsed_df.columns]
-            st.dataframe(parsed_df[preview_cols].head(20), use_container_width=True, hide_index=True)
+            st.dataframe(parsed_df[preview_cols].head(20), width="stretch", hide_index=True)
 
             total_pnl_preview = parsed_df["pnl"].sum()
             m1, m2, m3 = st.columns(3)
@@ -787,7 +907,7 @@ elif page == "📥 Import CSV":
             m2.metric("Net P/L in file", utils.format_currency(total_pnl_preview, CURRENCY_SYMBOL))
             m3.metric("Instruments", parsed_df["instrument"].nunique())
 
-            if st.button("📥 Import into Journal", type="primary", use_container_width=True):
+            if st.button("📥 Import into Journal", type="primary", width="stretch"):
                 result = db.bulk_upsert_csv_trades(parsed_df)
                 st.success(f"Imported **{result['inserted']}** new trades. "
                            f"Skipped **{result['skipped']}** already in your journal.")
@@ -825,7 +945,7 @@ elif page == "📜 Trade History":
 
         edited = st.data_editor(
             edit_df,
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
             num_rows="fixed",
             disabled=["id", "source", "margin_deployed", "return_pct"],
@@ -844,7 +964,7 @@ elif page == "📜 Trade History":
 
         c1, c2, c3 = st.columns([1, 1, 3])
         with c1:
-            if st.button("💾 Save edits", use_container_width=True):
+            if st.button("💾 Save edits", width="stretch"):
                 changes = 0
                 orig_indexed = edit_df.set_index("id")
                 for _, row in edited.iterrows():
@@ -864,7 +984,7 @@ elif page == "📜 Trade History":
             del_id = st.number_input("Delete ID", min_value=0, step=1, label_visibility="collapsed",
                                       placeholder="Trade ID to delete")
         with c3:
-            if st.button("🗑️ Delete trade by ID", use_container_width=False):
+            if st.button("🗑️ Delete trade by ID", width="content"):
                 if del_id:
                     db.delete_trade(int(del_id))
                     st.success(f"Deleted trade #{int(del_id)}.")
@@ -875,7 +995,7 @@ elif page == "📜 Trade History":
             data=filtered.to_csv(index=False).encode("utf-8"),
             file_name=f"trade_journal_export_{date.today().isoformat()}.csv",
             mime="text/csv",
-            use_container_width=True,
+            width="stretch",
         )
 
 
@@ -900,16 +1020,16 @@ elif page == "🔍 Analytics":
                 colors = [GREEN if v >= 0 else RED for v in byinst["pnl"]]
                 fig = go.Figure(go.Bar(x=byinst["instrument"], y=byinst["pnl"], marker_color=colors))
                 fig.update_layout(template=PLOTLY_TEMPLATE, height=340, title="Net P/L by Instrument")
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, width="stretch")
             with c2:
                 fig = go.Figure(go.Bar(x=byinst["instrument"], y=byinst["win_rate"], marker_color=ACCENT))
                 fig.update_layout(template=PLOTLY_TEMPLATE, height=340, title="Win Rate % by Instrument",
                                    yaxis_range=[0, 100])
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, width="stretch")
             st.dataframe(
                 byinst.rename(columns={"instrument": "Instrument", "pnl": "Net P/L",
                                         "trades": "Trades", "win_rate": "Win Rate %"}),
-                use_container_width=True, hide_index=True,
+                width="stretch", hide_index=True,
             )
 
         with tab2:
@@ -917,7 +1037,7 @@ elif page == "🔍 Analytics":
             colors = [GREEN if v >= 0 else RED for v in bywd["pnl"]]
             fig = go.Figure(go.Bar(x=bywd["weekday"], y=bywd["pnl"], marker_color=colors))
             fig.update_layout(template=PLOTLY_TEMPLATE, height=360, title="Net P/L by Weekday")
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width="stretch")
 
         with tab3:
             byhr = utils.pnl_by_hour(filtered)
@@ -925,13 +1045,13 @@ elif page == "🔍 Analytics":
             fig = go.Figure(go.Bar(x=byhr["hour"], y=byhr["pnl"], marker_color=colors))
             fig.update_layout(template=PLOTLY_TEMPLATE, height=360, title="Net P/L by Entry Hour",
                                xaxis_title="Hour of Day (Entry Time)")
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width="stretch")
 
         with tab4:
             fig = go.Figure(go.Histogram(x=filtered["pnl"], nbinsx=30, marker_color=ACCENT))
             fig.update_layout(template=PLOTLY_TEMPLATE, height=360, title="P/L Distribution",
                                xaxis_title=f"P/L ({CURRENCY_SYMBOL})", yaxis_title="Trade count")
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width="stretch")
 
             k = utils.compute_kpis(filtered)
             c1, c2, c3, c4 = st.columns(4)
@@ -960,7 +1080,7 @@ elif page == "⚙️ Settings":
             data=all_df.to_csv(index=False).encode("utf-8"),
             file_name=f"trade_journal_backup_{date.today().isoformat()}.csv",
             mime="text/csv",
-            use_container_width=True,
+            width="stretch",
         )
 
     st.markdown("<div style='height:10px'></div>", unsafe_allow_html=True)
