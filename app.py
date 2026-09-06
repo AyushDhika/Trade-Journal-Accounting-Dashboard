@@ -44,27 +44,45 @@ _init_db_once()
 
 CURRENCY_SYMBOL = "$"  # USD
 
+# Yahoo's XAUUSD=X spot ticker is unreliable (regionally gated, often returns
+# nothing at all). GC=F (COMEX Gold Futures) tracks spot gold closely enough
+# for % comparisons and is Yahoo's most reliable gold ticker; GLD (an ETF
+# holding physical gold) is a final fallback if futures data is unavailable —
+# its % moves track spot gold almost exactly even though its price level is a
+# fraction of gold's, which doesn't matter since we only ever use % change.
+GOLD_TICKER_CANDIDATES = [
+    ("GC=F", "COMEX Gold Futures"),
+    ("XAUUSD=X", "XAUUSD Spot"),
+    ("GLD", "SPDR Gold Shares ETF (proxy)"),
+]
+
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def fetch_gold_history(start_date: str, end_date: str) -> pd.DataFrame:
-    """Daily XAUUSD spot close prices from Yahoo Finance, cached for an hour
-    so we don't re-fetch on every Streamlit rerun (this app reruns its whole
-    script on every click/filter change). Needs internet access at runtime —
-    returns an empty DataFrame (never raises) if the fetch fails for any
-    reason, so the caller can show a friendly warning instead of crashing."""
-    try:
-        raw = yf.download("XAUUSD=X", start=start_date, end=end_date,
-                           progress=False, auto_adjust=False)
-        if raw is None or raw.empty:
-            return pd.DataFrame(columns=["date", "close"])
-        if isinstance(raw.columns, pd.MultiIndex):
-            raw.columns = raw.columns.get_level_values(0)
-        out = raw.reset_index()[["Date", "Close"]]
-        out.columns = ["date", "close"]
-        out["date"] = pd.to_datetime(out["date"])
-        return out.dropna(subset=["close"])
-    except Exception:
-        return pd.DataFrame(columns=["date", "close"])
+def fetch_gold_history(start_date: str, end_date: str):
+    """Daily gold price history from Yahoo Finance, cached for an hour so we
+    don't re-fetch on every Streamlit rerun (this app reruns its whole script
+    on every click/filter change). Tries a few tickers in order of
+    reliability and returns whichever one actually has data. Needs internet
+    access at runtime — returns an empty DataFrame (never raises) if every
+    candidate fails, so the caller can show a friendly warning instead of
+    crashing. Returns (dataframe, ticker_used_label)."""
+    for ticker, label in GOLD_TICKER_CANDIDATES:
+        try:
+            raw = yf.download(ticker, start=start_date, end=end_date,
+                               progress=False, auto_adjust=False)
+            if raw is None or raw.empty:
+                continue
+            if isinstance(raw.columns, pd.MultiIndex):
+                raw.columns = raw.columns.get_level_values(0)
+            out = raw.reset_index()[["Date", "Close"]]
+            out.columns = ["date", "close"]
+            out["date"] = pd.to_datetime(out["date"])
+            out = out.dropna(subset=["close"])
+            if not out.empty:
+                return out, label
+        except Exception:
+            continue
+    return pd.DataFrame(columns=["date", "close"]), None
 
 # ---------------------------------------------------------------------------
 # Global CSS — professional trading-terminal look, Apple-grade motion & depth
@@ -1175,7 +1193,8 @@ elif page == "🔍 Analytics":
 
         with tab5:
             st.caption(
-                "Benchmarked against live XAUUSD spot price (Yahoo Finance). "
+                "Benchmarked against gold price data (Yahoo Finance — tries COMEX futures "
+                "first, falls back to spot/ETF if unavailable). "
                 "Your P/L is in raw $ (no starting-capital tracking, since your "
                 "trading capital changes frequently) — gold's move is shown as a %, "
                 "side by side rather than on one shared scale."
@@ -1188,15 +1207,17 @@ elif page == "🔍 Analytics":
 
             start_d = pd.to_datetime(bench_source["exit_time"]).min().date()
             end_d = date.today() + timedelta(days=1)
-            gold_df = fetch_gold_history(str(start_d), str(end_d))
+            gold_df, gold_source_label = fetch_gold_history(str(start_d), str(end_d))
 
             if gold_df.empty:
                 st.warning(
                     "Couldn't fetch live gold price data right now — this needs internet "
-                    "access to Yahoo Finance at runtime. If you're running locally without "
-                    "internet, or Yahoo is temporarily unreachable, try again shortly."
+                    "access to Yahoo Finance at runtime, and tried COMEX futures, spot, and "
+                    "the GLD ETF as fallbacks. If you're running locally without internet, "
+                    "or Yahoo is temporarily unreachable, try again shortly."
                 )
             else:
+                st.caption(f"Gold data source: **{gold_source_label}** (via Yahoo Finance)")
                 pnl_periods = utils.pnl_by_period(bench_source, freq_code)
                 gold_periods = utils.gold_pct_by_period(gold_df, freq_code)
                 bench = utils.merge_benchmark(pnl_periods, gold_periods, freq_code)
