@@ -2,7 +2,7 @@
 utils.py — Broker CSV parsing + performance analytics for the Trade Journal.
 Also hosts the XAUUSD market-data layer (live spot + daily history) with
 multi-source fallback + bar-frequency validation, and the P/L-vs-Gold
-benchmark builder (merge_asof based, robust to gaps).
+benchmark builder (searchsorted asof lookup — pandas-version-proof).
 """
 import io
 import json
@@ -338,9 +338,8 @@ def format_percent(value: float) -> str:
 #   History   : stooq.com -> stooq.pl -> Yahoo GC=F (10y daily)
 #
 # Every history source is validated: if the median gap between bars is not
-# ~1 day (e.g. Yahoo sometimes downgrades range=max to MONTHLY bars, which
-# produced the bogus "+77% in a month" reading), the source is rejected and
-# the next one is tried.
+# ~1 day (e.g. a source downgrades to MONTHLY bars), it is rejected and the
+# next one is tried.
 # ===========================================================================
 GOLD_LIVE_URLS = [
     "https://api.gold-api.com/price/XAU",
@@ -529,8 +528,9 @@ def build_benchmark(trades_df: pd.DataFrame, gold_df: pd.DataFrame,
     gold_close = last daily gold close on/before the period's end date
     gold_pct   = that close vs the close on/before the PREVIOUS period's end
 
-    Uses merge_asof (date-based lookup) instead of groupby-join, so every
-    trade period gets a correct gold value even if the bar series has gaps.
+    Implemented with a binary search (np.searchsorted) over epoch floats —
+    deliberately NOT pd.merge_asof, whose strict dtype checks break across
+    pandas versions (datetime64[ns] vs [s]/[us] MergeError on Python 3.14).
     """
     cols = ["period", "period_label", "trades", "net_pnl", "gold_close", "gold_pct"]
     if trades_df is None or trades_df.empty or gold_df is None or gold_df.empty:
@@ -545,32 +545,39 @@ def build_benchmark(trades_df: pd.DataFrame, gold_df: pd.DataFrame,
     t["period"] = t["exit_dt"].dt.to_period(freq)
     agg = t.groupby("period").agg(net_pnl=("pnl", "sum"), trades=("pnl", "count"))
 
-    g = gold_df[["date", "close"]].dropna().sort_values("date")
+    g = gold_df[["date", "close"]].copy()
+    g["date"] = pd.to_datetime(g["date"], errors="coerce")
+    g["close"] = pd.to_numeric(g["close"], errors="coerce")
+    g = g.dropna(subset=["date", "close"]).sort_values("date")
+    if g.empty:
+        return pd.DataFrame(columns=cols)
 
-    periods = list(agg.index)
-    ends = [p.end_time for p in periods]
-    prev_ends = [(p - 1).end_time for p in periods]
+    # Epoch-second float arrays — immune to pandas datetime64 resolution quirks
+    g_epoch = np.array([pd.Timestamp(d).timestamp() for d in g["date"]], dtype="float64")
+    g_close = g["close"].to_numpy(dtype="float64")
+    TOL_SECONDS = 45.0 * 86400.0  # don't use stale closes older than ~45 days
 
-    stamps = sorted(set(ends) | set(prev_ends))
-    need = pd.DataFrame({"ts": stamps})
-    merged = pd.merge_asof(
-        need, g, left_on="ts", right_on="date",
-        direction="backward", tolerance=pd.Timedelta(days=45),
-    )
-    close_at = dict(zip(merged["ts"], merged["close"]))
+    def close_at(ts) -> float | None:
+        te = pd.Timestamp(ts).timestamp()
+        i = int(np.searchsorted(g_epoch, te, side="right")) - 1
+        if i < 0:
+            return None
+        if (te - g_epoch[i]) > TOL_SECONDS:
+            return None
+        return float(g_close[i])
 
     out = agg.reset_index()
-    gold_close = [close_at.get(e) for e in ends]
-    prev_close = [close_at.get(e) for e in prev_ends]
+    ends = [p.end_time for p in out["period"]]
+    prev_ends = [(p - 1).end_time for p in out["period"]]
+    gold_close = [close_at(e) for e in ends]
+    prev_close = [close_at(e) for e in prev_ends]
 
     def _pct(c, p):
-        if c is None or p is None:
+        if c is None or p is None or not p:
             return None
-        if pd.isna(c) or pd.isna(p) or not p:
-            return None
-        return (float(c) / float(p) - 1) * 100
+        return (c / p - 1) * 100
 
-    out["gold_close"] = [None if (v is None or pd.isna(v)) else float(v) for v in gold_close]
+    out["gold_close"] = gold_close
     out["gold_pct"] = [_pct(c, p) for c, p in zip(gold_close, prev_close)]
     out["period_label"] = out["period"].map(lambda p: _period_label(p, freq))
     return out[cols]
