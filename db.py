@@ -48,6 +48,15 @@ CREATE TABLE IF NOT EXISTS settings (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS capital_events (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_date   TEXT NOT NULL,        -- ISO date (YYYY-MM-DD) the capital changed
+    amount       REAL NOT NULL,        -- positive = deposit, negative = withdrawal
+    note         TEXT,
+    created_at   TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_capital_events_date ON capital_events(event_date);
 """
 
 
@@ -199,6 +208,7 @@ def wipe_all():
     with get_conn() as conn:
         conn.execute("DELETE FROM trades")
         conn.execute("DELETE FROM settings")
+        conn.execute("DELETE FROM capital_events")
 
 
 # ---------- Settings helpers ----------
@@ -244,3 +254,58 @@ def get_contract_size(instrument: str) -> float:
 def set_contract_size(instrument: str, size: float):
     key = f"contract_size_{instrument.upper()}"
     set_setting(key, str(size))
+
+
+# ---------- Capital ledger helpers ----------
+def insert_capital_event(event_date: str, amount: float, note: str = None) -> int:
+    """Log a deposit (positive amount) or withdrawal (negative amount)."""
+    with get_conn() as conn:
+        cur = conn.execute(
+            "INSERT INTO capital_events (event_date, amount, note, created_at) "
+            "VALUES (?, ?, ?, ?)",
+            (event_date, amount, note, datetime.utcnow().isoformat()),
+        )
+        return cur.lastrowid
+
+
+def fetch_capital_events(start_date: Optional[str] = None,
+                         end_date: Optional[str] = None) -> pd.DataFrame:
+    query = "SELECT * FROM capital_events WHERE 1=1"
+    params: list = []
+    if start_date:
+        query += " AND date(event_date) >= date(?)"
+        params.append(start_date)
+    if end_date:
+        query += " AND date(event_date) <= date(?)"
+        params.append(end_date)
+    query += " ORDER BY date(event_date) ASC, id ASC"
+    with get_conn() as conn:
+        df = pd.read_sql_query(query, conn, params=params)
+    return df
+
+
+def update_capital_event(event_id: int, updates: dict):
+    if not updates:
+        return
+    set_clause = ", ".join(f"{k} = ?" for k in updates.keys())
+    with get_conn() as conn:
+        conn.execute(
+            f"UPDATE capital_events SET {set_clause} WHERE id = ?",
+            list(updates.values()) + [event_id],
+        )
+
+
+def delete_capital_event(event_id: int):
+    with get_conn() as conn:
+        conn.execute("DELETE FROM capital_events WHERE id = ?", (event_id,))
+
+
+def capital_events_count() -> int:
+    with get_conn() as conn:
+        return conn.execute("SELECT COUNT(*) c FROM capital_events").fetchone()["c"]
+
+
+def total_net_capital() -> float:
+    with get_conn() as conn:
+        row = conn.execute("SELECT COALESCE(SUM(amount), 0) s FROM capital_events").fetchone()
+        return float(row["s"])
