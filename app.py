@@ -54,6 +54,10 @@ THEMES = {
         "green": "#22C55E", "red": "#EF4444", "accent": "#3B82F6",
         "chart_text": "#C9D2DA", "grid": "#1D242C",
         "fill_green": "rgba(34,197,94,0.08)",
+        # --- FIX: added missing card and other common keys ---
+        "card": "#141B22",
+        "bg": "#0A0D12",
+        "text": "#E6EDF3",
         "vars": """
 :root {
   --bg: #0A0D12;
@@ -85,6 +89,10 @@ THEMES = {
         "green": "#16A34A", "red": "#DC2626", "accent": "#2563EB",
         "chart_text": "#334155", "grid": "#E2E8F0",
         "fill_green": "rgba(22,163,74,0.10)",
+        # --- FIX: added missing card and other common keys ---
+        "card": "#FFFFFF",
+        "bg": "#F4F6F9",
+        "text": "#0F172A",
         "vars": """
 :root {
   --bg: #F4F6F9;
