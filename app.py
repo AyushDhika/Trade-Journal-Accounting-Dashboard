@@ -248,6 +248,36 @@ div[data-testid="stMetricValue"] { font-variant-numeric: tabular-nums; }
   transition: transform 0.2s var(--ease);
 }
 
+/* ---------- Analysis / verdict box ---------- */
+.analysis-box {
+  background: linear-gradient(155deg, var(--card) 0%, var(--card-2) 100%);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--tone-color);
+  border-radius: 14px;
+  padding: 18px 20px;
+  margin: 6px 0 22px 0;
+  animation: fadeIn 0.3s var(--ease) both;
+}
+.analysis-badge {
+  display: inline-block;
+  background: color-mix(in srgb, var(--tone-color) 16%, transparent);
+  color: var(--tone-color);
+  padding: 3px 12px; border-radius: 20px;
+  font-size: 11.5px; font-weight: 700; letter-spacing: 0.02em;
+  text-transform: uppercase;
+  margin-bottom: 10px;
+}
+.analysis-headline {
+  font-size: 16px; font-weight: 700; color: var(--text);
+  margin-bottom: 10px; line-height: 1.4;
+}
+.analysis-bullets { margin: 0; padding-left: 18px; }
+.analysis-bullets li {
+  font-size: 13.5px; color: var(--text-dim);
+  margin-bottom: 6px; line-height: 1.5;
+}
+.analysis-bullets li:last-child { margin-bottom: 0; }
+
 /* ---------- Sidebar ---------- */
 section[data-testid="stSidebar"] {
   background-color: var(--sidebar-bg);
@@ -540,7 +570,7 @@ with st.sidebar:
     page = st.radio(
         "Navigate",
         ["📊 Dashboard", "📅 Calendar", "➕ Add Trade", "📥 Import CSV",
-         "📜 Trade History", "🔍 Analytics", "⚙️ Settings"],
+         "📜 Trade History", "💰 Capital", "🔍 Analytics", "⚙️ Settings"],
         label_visibility="collapsed",
     )
 
@@ -558,6 +588,7 @@ PAGE_TITLES = {
     "➕ Add Trade": ("Add Trade", "Manually log a closed trade"),
     "📥 Import CSV": ("Import Broker CSV", "Upload your broker's Closed Trades Report to sync trades automatically"),
     "📜 Trade History": ("Trade History", "Browse, filter, edit and export every logged trade"),
+    "💰 Capital": ("Capital Ledger", "Log deposits and withdrawals so return %, not just $ P/L, stays accurate"),
     "🔍 Analytics": ("Deep Analytics", "Breakdowns by instrument, weekday, hour — plus a live XAUUSD benchmark"),
     "⚙️ Settings": ("Settings", "Preferences and data management"),
 }
@@ -1061,6 +1092,134 @@ elif page == "📜 Trade History":
         )
 
 # ---------------------------------------------------------------------------
+# PAGE: Capital Ledger
+# ---------------------------------------------------------------------------
+elif page == "💰 Capital":
+    st.markdown("Log every time you add or remove capital from your account. This keeps "
+                "**Return %** figures (in Analytics → vs-Gold benchmark) honest — a big deposit "
+                "shouldn't look like a trading gain, and a withdrawal shouldn't look like a loss.")
+
+    with st.form("add_capital_form", clear_on_submit=True):
+        cc1, cc2, cc3 = st.columns([1, 1, 2])
+        with cc1:
+            event_date = st.date_input("Date", value=date.today())
+        with cc2:
+            event_type = st.selectbox("Type", ["Deposit", "Withdrawal"])
+        with cc3:
+            amount_in = st.number_input("Amount", min_value=0.0, value=0.0, step=100.0, format="%.2f")
+        note = st.text_input("Note (optional)", placeholder="e.g. Monthly top-up, broker transfer")
+        submitted_cap = st.form_submit_button("💾 Log capital change", width="stretch", type="primary")
+
+        if submitted_cap:
+            if amount_in <= 0:
+                st.error("Enter an amount greater than 0.")
+            else:
+                signed = amount_in if event_type == "Deposit" else -amount_in
+                db.insert_capital_event(event_date.isoformat(), signed, note.strip() or None)
+                st.success(f"Logged {event_type.lower()} of {utils.format_currency(amount_in, CURRENCY_SYMBOL)}.")
+                st.rerun()
+
+    st.markdown("<div style='height:6px'></div>", unsafe_allow_html=True)
+    cap_df = db.fetch_capital_events()
+
+    if cap_df.empty:
+        st.info("No capital changes logged yet — add your first deposit above. Until then, "
+                "Return % on the Analytics tab falls back to raw dollar P/L.")
+    else:
+        cap_df["event_date"] = pd.to_datetime(cap_df["event_date"], errors="coerce")
+        cap_df = cap_df.sort_values("event_date").reset_index(drop=True)
+        cap_df["running_balance"] = cap_df["amount"].cumsum()
+
+        net_capital = float(cap_df["amount"].sum())
+        total_deposits = float(cap_df.loc[cap_df["amount"] > 0, "amount"].sum())
+        total_withdrawals = float(-cap_df.loc[cap_df["amount"] < 0, "amount"].sum())
+
+        kc1, kc2, kc3 = st.columns(3)
+        with kc1:
+            kpi_card("Net Capital Contributed", utils.format_currency(net_capital, CURRENCY_SYMBOL),
+                     sub=f"{len(cap_df)} entries", positive=(net_capital >= 0))
+        with kc2:
+            kpi_card("Total Deposits", utils.format_currency(total_deposits, CURRENCY_SYMBOL), positive=True)
+        with kc3:
+            kpi_card("Total Withdrawals", utils.format_currency(total_withdrawals, CURRENCY_SYMBOL),
+                     positive=(total_withdrawals == 0))
+
+        st.markdown("<div style='height:14px'></div>", unsafe_allow_html=True)
+
+        # running-balance chart
+        fig_cap = go.Figure()
+        fig_cap.add_trace(go.Scatter(
+            x=cap_df["event_date"], y=cap_df["running_balance"],
+            mode="lines+markers", name="Net capital in account",
+            line=dict(color=GREEN, width=2.4, shape="hv"),
+            fill="tozeroy", fillcolor=C["fill_green"],
+            hovertemplate="%{x|%d %b %Y}<br>Balance: " + CURRENCY_SYMBOL + "%{y:,.2f}<extra></extra>",
+        ))
+        fig_cap.update_layout(
+            template=PLOTLY_TEMPLATE, height=320,
+            title=dict(text="Capital balance over time", y=0.97, yanchor="top"),
+            margin=dict(l=10, r=10, t=60, b=10),
+            showlegend=False,
+        )
+        fig_cap.update_yaxes(title_text=f"Balance ({CURRENCY_SYMBOL})")
+        st.plotly_chart(fig_cap, width="stretch")
+
+        st.markdown('<div class="section-title">Capital Events</div>', unsafe_allow_html=True)
+        display_cap = cap_df[["id", "event_date", "amount", "running_balance", "note"]].copy()
+        display_cap = display_cap.sort_values("event_date", ascending=False).reset_index(drop=True)
+
+        edited_cap = st.data_editor(
+            display_cap,
+            width="stretch",
+            hide_index=True,
+            num_rows="fixed",
+            disabled=["id", "running_balance"],
+            column_config={
+                "id": st.column_config.NumberColumn("ID", width="small"),
+                "event_date": st.column_config.DateColumn("Date"),
+                "amount": st.column_config.NumberColumn(
+                    "Amount", format="%.2f",
+                    help="Positive = deposit, negative = withdrawal"),
+                "running_balance": st.column_config.NumberColumn("Running Balance", format="%.2f"),
+                "note": st.column_config.TextColumn("Note"),
+            },
+            key="capital_editor",
+        )
+
+        ec1, ec2, ec3 = st.columns([1, 1, 3])
+        with ec1:
+            if st.button("💾 Save edits", width="stretch", key="cap_save"):
+                changes = 0
+                orig_indexed = display_cap.set_index("id")
+                for _, row in edited_cap.iterrows():
+                    rid = int(row["id"])
+                    updates = {}
+                    for col in ("event_date", "amount", "note"):
+                        new_val = row[col]
+                        old_val = orig_indexed.loc[rid, col]
+                        if pd.isna(new_val) and pd.isna(old_val):
+                            continue
+                        if new_val != old_val:
+                            if col == "event_date":
+                                new_val = pd.Timestamp(new_val).date().isoformat()
+                            updates[col] = new_val
+                    if updates:
+                        db.update_capital_event(rid, updates)
+                        changes += 1
+                st.success(f"Updated {changes} entr(y/ies).")
+                st.rerun()
+        with ec2:
+            del_cap_id = st.number_input("Delete ID", min_value=0, step=1,
+                                         label_visibility="collapsed",
+                                         placeholder="Entry ID to delete", key="cap_del_id")
+        with ec3:
+            if st.button("🗑️ Delete entry by ID", width="content", key="cap_del_btn"):
+                if del_cap_id:
+                    db.delete_capital_event(int(del_cap_id))
+                    st.success(f"Deleted capital entry #{int(del_cap_id)}.")
+                    st.rerun()
+
+# ---------------------------------------------------------------------------
 # PAGE: Analytics  (includes 🥇 vs-Gold benchmark tab)
 # ---------------------------------------------------------------------------
 elif page == "🔍 Analytics":
@@ -1265,21 +1424,61 @@ elif page == "🔍 Analytics":
                         corr = bdf["net_pnl"].corr(bdf["gold_pct"])
                     green_periods = int((bdf["net_pnl"] > 0).sum())
 
-                    bm1, bm2, bm3, bm4 = st.columns(4)
+                    # ---- capital-ledger based % return (Modified Dietz) ----
+                    # Uses your logged deposits/withdrawals so a big top-up doesn't
+                    # masquerade as a trading gain when comparing % return to gold.
+                    window_start = bdf["period"].iloc[0].start_time
+                    window_end = bdf["period"].iloc[-1].end_time
+                    cap_df_all = db.fetch_capital_events()
+                    return_pct = None
+                    if not cap_df_all.empty:
+                        cap_df_all = cap_df_all.copy()
+                        cap_df_all["event_date"] = pd.to_datetime(cap_df_all["event_date"], errors="coerce")
+                        begin_capital = utils.capital_as_of(cap_df_all, window_start - pd.Timedelta(days=1))
+                        in_window = cap_df_all[(cap_df_all["event_date"] >= window_start) &
+                                               (cap_df_all["event_date"] <= window_end)]
+                        cashflows = list(zip(in_window["event_date"], in_window["amount"]))
+                        return_pct = utils.modified_dietz_return(
+                            begin_capital, bench_pnl, cashflows, window_start, window_end)
+
+                    bm1, bm2, bm3, bm4, bm5 = st.columns(5)
                     with bm1:
                         kpi_card("P/L over Window", utils.format_currency(bench_pnl, CURRENCY_SYMBOL),
                                  sub=f"{len(bdf)} {bench_freq_label.lower()} periods",
                                  positive=(bench_pnl >= 0))
                     with bm2:
+                        kpi_card("Return % (Modified Dietz)",
+                                 "—" if return_pct is None else f"{return_pct:+.2f}%",
+                                 sub="on deployed capital" if return_pct is not None else "log capital in 💰 Capital",
+                                 positive=None if return_pct is None else (return_pct >= 0))
+                    with bm3:
                         kpi_card("Gold Move (window)", "—" if gold_move is None else f"{gold_move:+.2f}%",
                                  sub="first → last period close",
                                  positive=None if gold_move is None else (gold_move >= 0))
-                    with bm3:
+                    with bm4:
                         kpi_card("Correlation P/L ↔ Gold", "—" if (corr is None or pd.isna(corr)) else f"{corr:.2f}",
                                  sub="≈0 → your edge is independent of gold")
-                    with bm4:
+                    with bm5:
                         kpi_card("Green Periods", f"{green_periods}/{len(bdf)}",
                                  positive=(green_periods >= len(bdf) / 2))
+
+                    # ---- overall analysis verdict ----
+                    verdict = utils.analyze_gold_relationship(
+                        bench_pnl, gold_move, corr, green_periods, len(bdf), bench_freq_label,
+                        return_pct=return_pct)
+                    tone_color = {"good": GREEN, "neutral": ACCENT, "caution": RED}[verdict["tone"]]
+                    bullets_html = "".join(f"<li>{b}</li>" for b in verdict["bullets"])
+                    st.markdown(f"""
+<div class="analysis-box" style="--tone-color: {tone_color};">
+  <div class="analysis-badge">{verdict['badge']}</div>
+  <div class="analysis-headline">{verdict['headline']}</div>
+  <ul class="analysis-bullets">{bullets_html}</ul>
+</div>
+""", unsafe_allow_html=True)
+                    if return_pct is None:
+                        st.caption("💡 Add your deposits/withdrawals in **💰 Capital** to unlock a real "
+                                   "% return figure here — right now the verdict above is based on raw "
+                                   "dollar P/L only.")
 
                     view = bdf.tail(60)
                     if len(bdf) > 60:
@@ -1299,9 +1498,14 @@ elif page == "🔍 Analytics":
                         line=dict(color=ACCENT, width=2.2), marker=dict(size=5),
                         hovertemplate="%{x}<br>Gold: %{y:+.2f}%<extra></extra>",
                     ), secondary_y=True)
-                    fig.update_layout(template=PLOTLY_TEMPLATE, height=380,
-                                      title=f"{bench_freq_label} P/L vs Gold movement",
-                                      legend=dict(orientation="h", yanchor="bottom", y=1.0, x=0))
+                    fig.update_layout(
+                        template=PLOTLY_TEMPLATE, height=420,
+                        title=dict(text=f"{bench_freq_label} P/L vs Gold movement",
+                                   y=0.97, yanchor="top"),
+                        margin=dict(l=10, r=10, t=60, b=10),
+                        legend=dict(orientation="h", yanchor="top", y=-0.16,
+                                   xanchor="center", x=0.5),
+                    )
                     fig.update_yaxes(title_text=f"P/L ({CURRENCY_SYMBOL})", secondary_y=False)
                     fig.update_yaxes(title_text="Gold Δ%", secondary_y=True)
                     st.plotly_chart(fig, width="stretch")
@@ -1321,9 +1525,14 @@ elif page == "🔍 Analytics":
                         line=dict(color=ACCENT, width=2, dash="dot"),
                         hovertemplate="%{x}<br>Gold index: %{y:.1f}<extra></extra>",
                     ), secondary_y=True)
-                    fig2.update_layout(template=PLOTLY_TEMPLATE, height=360,
-                                       title="Cumulative P/L vs Gold (indexed)",
-                                       legend=dict(orientation="h", yanchor="bottom", y=1.0, x=0))
+                    fig2.update_layout(
+                        template=PLOTLY_TEMPLATE, height=400,
+                        title=dict(text="Cumulative P/L vs Gold (indexed)",
+                                   y=0.97, yanchor="top"),
+                        margin=dict(l=10, r=10, t=60, b=10),
+                        legend=dict(orientation="h", yanchor="top", y=-0.16,
+                                   xanchor="center", x=0.5),
+                    )
                     fig2.update_yaxes(title_text=f"Cumulative P/L ({CURRENCY_SYMBOL})", secondary_y=False)
                     fig2.update_yaxes(title_text="Gold index", secondary_y=True)
                     st.plotly_chart(fig2, width="stretch")
