@@ -1,4 +1,4 @@
-"""
+
 db.py — SQLite persistence layer for the Trade Journal dashboard.
 
 All trades (manual entries and CSV imports) live in a single `trades` table.
