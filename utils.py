@@ -581,3 +581,192 @@ def build_benchmark(trades_df: pd.DataFrame, gold_df: pd.DataFrame,
     out["gold_pct"] = [_pct(c, p) for c, p in zip(gold_close, prev_close)]
     out["period_label"] = out["period"].map(lambda p: _period_label(p, freq))
     return out[cols]
+
+
+# ----- gold relationship verdict ------------------------------------------
+def analyze_gold_relationship(bench_pnl: float, gold_move: float | None,
+                              corr: float | None, green_periods: int,
+                              total_periods: int, freq_label: str,
+                              return_pct: float | None = None) -> dict:
+    """
+    Turn the benchmark KPIs into a plain-English verdict on whether trading
+    results look skill-driven, trend-driven (riding gold), contrarian, or
+    unexplained losses. Returns {tone, badge, headline, bullets}.
+    tone in {"good", "neutral", "caution"} maps to green/blue/red in the UI.
+
+    return_pct, when provided (a Modified-Dietz % return on actual deployed
+    capital for the same window), lets the verdict compare your % return
+    directly against gold's % move — a fairer apples-to-apples comparison
+    than raw dollar P/L, since it accounts for deposits/withdrawals.
+    """
+    profitable = bench_pnl > 0
+    flat_pnl = abs(bench_pnl) < 1e-9
+    win_rate = (green_periods / total_periods) if total_periods else 0.0
+
+    have_corr = corr is not None and not pd.isna(corr)
+    corr_abs = abs(corr) if have_corr else None
+    if have_corr:
+        if corr_abs < 0.2:
+            corr_strength = "negligible"
+        elif corr_abs < 0.5:
+            corr_strength = "moderate"
+        else:
+            corr_strength = "strong"
+        corr_dir = "positive" if corr >= 0 else "negative"
+    else:
+        corr_strength, corr_dir = None, None
+
+    have_gold_move = gold_move is not None and not pd.isna(gold_move)
+    if have_gold_move:
+        gold_trend = "up" if gold_move > 0.5 else ("down" if gold_move < -0.5 else "flat")
+    else:
+        gold_trend = None
+
+    have_return = return_pct is not None and not pd.isna(return_pct)
+
+    bullets = []
+
+    # --- P/L vs gold move bullet ---
+    if have_gold_move:
+        bullets.append(
+            f"You booked {format_currency(bench_pnl, '$')} in net P/L across "
+            f"{total_periods} {freq_label.lower()} period(s) while gold moved "
+            f"{gold_move:+.2f}% over the same window."
+        )
+    else:
+        bullets.append(
+            f"You booked {format_currency(bench_pnl, '$')} in net P/L across "
+            f"{total_periods} {freq_label.lower()} period(s). Not enough gold "
+            "history to measure gold's move over the same window yet."
+        )
+
+    # --- return% vs gold% bullet (only when a capital ledger makes this valid) ---
+    if have_return and have_gold_move:
+        diff = return_pct - gold_move
+        beat = diff > 0
+        bullets.append(
+            f"On your actual deployed capital, that's a {return_pct:+.2f}% return "
+            f"({'beating' if beat else 'trailing'} gold by {abs(diff):.2f} percentage "
+            "points over the same window) — this accounts for any deposits or "
+            "withdrawals during the window."
+        )
+    elif have_return:
+        bullets.append(f"On your actual deployed capital, that's a {return_pct:+.2f}% return for the window.")
+
+    # --- correlation bullet ---
+    if have_corr:
+        if corr_strength == "negligible":
+            bullets.append(
+                f"Correlation to gold is {corr:.2f} ({corr_strength}) — your period-by-period "
+                "P/L doesn't move in step with gold's price. Results look driven by your own "
+                "trade selection and timing, not by simply holding a directional gold view."
+            )
+        else:
+            rel = "move with" if corr_dir == "positive" else "move opposite to"
+            bullets.append(
+                f"Correlation to gold is {corr:.2f} ({corr_strength}, {corr_dir}) — your P/L "
+                f"tends to {rel} gold's price on a period-by-period basis. Part of this "
+                "window's result may be explained by gold's own trend rather than pure edge."
+            )
+    else:
+        bullets.append(
+            "Not enough overlapping periods yet to compute a reliable correlation "
+            "— give it a few more periods of trading history."
+        )
+
+    # --- win-rate bullet ---
+    bullets.append(
+        f"You were net positive in {green_periods}/{total_periods} "
+        f"{freq_label.lower()} period(s) ({win_rate*100:.0f}% win rate by period)."
+    )
+
+    # --- verdict ---
+    if flat_pnl:
+        tone, badge = "neutral", "Flat"
+        headline = "No net edge over this window — P/L is essentially breakeven against gold."
+    elif profitable and have_corr and corr_strength == "negligible":
+        tone, badge = "good", "Skill-driven edge"
+        headline = ("Profitable and largely independent of gold's direction — a genuine "
+                    "edge from trade selection, not a lucky ride on the gold trend.")
+    elif profitable and have_corr and corr_strength != "negligible" and corr_dir == "positive":
+        tone, badge = "neutral", "Trend-assisted"
+        headline = ("Profitable, but meaningfully correlated with gold's own moves — "
+                    "some of this edge may fade if gold chops sideways or reverses.")
+    elif profitable and have_corr and corr_strength != "negligible" and corr_dir == "negative":
+        tone, badge = "neutral", "Contrarian edge"
+        headline = ("Profitable with a contrarian tilt — you tend to do well when gold "
+                    "pulls back. Worth checking this holds up in strong trending markets.")
+    elif profitable:
+        tone, badge = "good", "Profitable"
+        headline = "Profitable over this window; not enough data yet to confirm if it's skill or trend."
+    elif have_corr and corr_strength == "negligible":
+        tone, badge = "caution", "Unexplained losses"
+        headline = ("Losses aren't explained by gold's direction — the issue looks strategy-side "
+                    "(entries, sizing, or timing), not a bad gold call.")
+    elif have_corr and corr_dir == "positive" and gold_trend == "down":
+        tone, badge = "caution", "Wrong side of the trend"
+        headline = "Losing money while positively correlated to a falling gold market — you're leaning the wrong way on direction."
+    elif have_corr and corr_dir == "negative" and gold_trend == "up":
+        tone, badge = "caution", "Wrong side of the trend"
+        headline = "Losing money while negatively correlated to a rising gold market — you're leaning the wrong way on direction."
+    else:
+        tone, badge = "caution", "Underperforming"
+        headline = "Net negative over this window relative to gold — worth a closer look at what's dragging results down."
+
+    # --- sharpen headline with actual %-vs-gold%, when we have a capital ledger ---
+    if have_return and have_gold_move:
+        diff = return_pct - gold_move
+        if diff > 0:
+            headline += f" You're outperforming gold by {diff:.2f} points ({return_pct:+.2f}% vs {gold_move:+.2f}%)."
+        elif diff < 0:
+            headline += f" You're trailing gold by {abs(diff):.2f} points ({return_pct:+.2f}% vs {gold_move:+.2f}%)."
+
+    return {"tone": tone, "badge": badge, "headline": headline, "bullets": bullets}
+
+
+# ----- capital ledger / Modified Dietz return ------------------------------
+def capital_as_of(capital_df: pd.DataFrame, as_of_date) -> float:
+    """Net capital contributed (deposits - withdrawals) on/before as_of_date."""
+    if capital_df is None or capital_df.empty:
+        return 0.0
+    d = pd.to_datetime(capital_df["event_date"], errors="coerce")
+    mask = d <= pd.Timestamp(as_of_date)
+    return float(capital_df.loc[mask, "amount"].sum())
+
+
+def modified_dietz_return(begin_capital: float, net_pnl: float,
+                          cashflows: list, period_start, period_end) -> float | None:
+    """
+    Modified Dietz % return for a window, given:
+      begin_capital — net capital in the account at the START of the window
+      net_pnl       — trading P/L generated during the window
+      cashflows     — list of (event_date, amount) deposits/withdrawals that
+                       landed DURING the window (excludes begin_capital itself)
+      period_start / period_end — window bounds (inclusive), any date-like
+
+    Formula: R = (net_pnl) / (begin_capital + sum(CF_i * weight_i))
+    where weight_i = (days remaining in period after the flow) / (total days),
+    i.e. money added early in the window counts almost fully toward the
+    denominator, money added right at the end barely counts.
+
+    Returns None if the denominator is non-positive (no meaningful base to
+    measure a % return against) or the window has zero duration.
+    """
+    start = pd.Timestamp(period_start)
+    end = pd.Timestamp(period_end)
+    total_days = (end - start).total_seconds() / 86400.0
+    if total_days <= 0:
+        return None
+
+    weighted_cf = 0.0
+    for ev_date, amount in cashflows:
+        ev = pd.Timestamp(ev_date)
+        days_remaining = (end - ev).total_seconds() / 86400.0
+        days_remaining = min(max(days_remaining, 0.0), total_days)
+        weight = days_remaining / total_days
+        weighted_cf += float(amount) * weight
+
+    denom = begin_capital + weighted_cf
+    if denom <= 0:
+        return None
+    return (net_pnl / denom) * 100
