@@ -770,3 +770,91 @@ def modified_dietz_return(begin_capital: float, net_pnl: float,
     if denom <= 0:
         return None
     return (net_pnl / denom) * 100
+
+
+# ----- AI Q&A context builder -----------------------------------------------
+def build_ai_context(trades_df: pd.DataFrame, capital_df: pd.DataFrame,
+                     max_raw_trades: int = 400) -> str:
+    """
+    Assemble a single text block summarizing the whole journal — KPIs,
+    breakdowns, capital ledger, and the raw trade log — for use as the
+    system-context of an AI Q&A chat. Kept as plain text (not JSON) since
+    that's what chat models parse most reliably and cheaply.
+    """
+    lines = []
+    lines.append(f"Data as of: {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}")
+    lines.append(f"Total trades logged: {len(trades_df)}")
+
+    if trades_df.empty:
+        lines.append("No trades have been logged yet.")
+    else:
+        k = compute_kpis(trades_df)
+        lines.append("\n## Overall performance")
+        lines.append(f"- Net P/L: {format_currency(k['total_pnl'])}")
+        lines.append(f"- Win rate: {k['win_rate']:.1f}%")
+        pf = k['profit_factor']
+        lines.append(f"- Profit factor: {'∞' if pf == float('inf') else f'{pf:.2f}'}")
+        lines.append(f"- Expectancy per trade: {format_currency(k['expectancy'])}")
+        lines.append(f"- Avg win: {format_currency(k['avg_win'])} | Avg loss: {format_currency(k['avg_loss'])}")
+        rr = k['avg_rr']
+        lines.append(f"- Avg win/loss ratio: {'∞' if rr == float('inf') else f'{rr:.2f}'}")
+        lines.append(f"- Best trade: {format_currency(k['best_trade'])} | Worst trade: {format_currency(k['worst_trade'])}")
+        lines.append(f"- Max drawdown: {format_currency(k['max_drawdown'])}")
+        lines.append(f"- Current streak: {k['current_streak']} (positive = winning streak, negative = losing streak)")
+        lines.append(f"- Total fees/tax/commission paid: {format_currency(k['total_fees'])}")
+
+        cb = cost_breakdown(trades_df)
+        lines.append(f"- Gross P/L: {format_currency(cb['gross_pnl'])} → Net P/L after costs: {format_currency(cb['net_pnl'])}")
+
+        by_inst = pnl_by_instrument(trades_df)
+        if not by_inst.empty:
+            lines.append("\n## P/L by instrument")
+            for _, r in by_inst.iterrows():
+                lines.append(f"- {r['instrument']}: {format_currency(r['pnl'])} over {int(r['trades'])} trades, {r['win_rate']:.0f}% win rate")
+
+        by_wd = pnl_by_weekday(trades_df)
+        if not by_wd.empty:
+            lines.append("\n## P/L by weekday")
+            for _, r in by_wd.iterrows():
+                lines.append(f"- {r['weekday']}: {format_currency(r['pnl'])} over {int(r['trades'])} trades")
+
+        by_hr = pnl_by_hour(trades_df)
+        if not by_hr.empty:
+            lines.append("\n## P/L by entry hour (24h)")
+            for _, r in by_hr.sort_values("hour").iterrows():
+                lines.append(f"- {int(r['hour']):02d}:00 — {format_currency(r['pnl'])} over {int(r['trades'])} trades")
+
+        by_month = monthly_summary(trades_df)
+        if not by_month.empty:
+            lines.append("\n## P/L by month")
+            for _, r in by_month.iterrows():
+                lines.append(f"- {r['month']}: {format_currency(r['pnl'])} over {int(r['trades'])} trades")
+
+    # ---- capital ledger ----
+    lines.append("\n## Capital ledger")
+    if capital_df is None or capital_df.empty:
+        lines.append("No capital deposits/withdrawals have been logged.")
+    else:
+        net_capital = float(capital_df["amount"].sum())
+        deposits = float(capital_df.loc[capital_df["amount"] > 0, "amount"].sum())
+        withdrawals = float(-capital_df.loc[capital_df["amount"] < 0, "amount"].sum())
+        lines.append(f"- Net capital contributed: {format_currency(net_capital)}")
+        lines.append(f"- Total deposits: {format_currency(deposits)} | Total withdrawals: {format_currency(withdrawals)}")
+        lines.append("- Events (date, amount, note):")
+        for _, r in capital_df.sort_values("event_date").iterrows():
+            note = r.get("note") or ""
+            lines.append(f"  - {r['event_date']}: {format_currency(float(r['amount']))} {('— ' + note) if note else ''}")
+
+    # ---- raw trade log (trimmed columns, capped row count) ----
+    if not trades_df.empty:
+        cols = ["id", "exit_time", "instrument", "side", "lot_size", "entry_price",
+                "exit_price", "pnl", "strategy", "remarks"]
+        cols = [c for c in cols if c in trades_df.columns]
+        raw = trades_df[cols].sort_values("exit_time", ascending=False)
+        truncated = len(raw) > max_raw_trades
+        if truncated:
+            raw = raw.head(max_raw_trades)
+        lines.append(f"\n## Raw trade log{' (most recent ' + str(max_raw_trades) + ' of ' + str(len(trades_df)) + ' trades — older trades are summarized above but not listed individually)' if truncated else ' (all trades)'}")
+        lines.append(raw.to_csv(index=False))
+
+    return "\n".join(lines)
