@@ -14,6 +14,7 @@ import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import streamlit as st
+import streamlit.components.v1 as components
 
 import db
 import utils
@@ -570,7 +571,7 @@ with st.sidebar:
     page = st.radio(
         "Navigate",
         ["📊 Dashboard", "📅 Calendar", "➕ Add Trade", "📥 Import CSV",
-         "📜 Trade History", "💰 Capital", "🔍 Analytics", "⚙️ Settings"],
+         "📜 Trade History", "💰 Capital", "🔍 Analytics", "🤖 AI Q&A", "⚙️ Settings"],
         label_visibility="collapsed",
     )
 
@@ -590,6 +591,7 @@ PAGE_TITLES = {
     "📜 Trade History": ("Trade History", "Browse, filter, edit and export every logged trade"),
     "💰 Capital": ("Capital Ledger", "Log deposits and withdrawals so return %, not just $ P/L, stays accurate"),
     "🔍 Analytics": ("Deep Analytics", "Breakdowns by instrument, weekday, hour — plus a live XAUUSD benchmark"),
+    "🤖 AI Q&A": ("Ask Your Journal", "Chat with an AI that can see your full trade log, capital ledger, and stats"),
     "⚙️ Settings": ("Settings", "Preferences and data management"),
 }
 title, subtitle = PAGE_TITLES[page]
@@ -1549,6 +1551,189 @@ elif page == "🔍 Analytics":
                     st.dataframe(tbl, width="stretch", hide_index=True)
                     st.caption("Gold Δ% = period close vs previous period close. "
                                "Periods shown are only the ones where you had trades.")
+
+# ---------------------------------------------------------------------------
+# PAGE: AI Q&A (Puter.js — free, keyless AI chat in the browser)
+# ---------------------------------------------------------------------------
+elif page == "🤖 AI Q&A":
+    st.markdown(
+        "Ask questions about your whole trading journal — performance, per-instrument "
+        "breakdowns, streaks, capital history, anything in your data. This runs "
+        "**entirely in your browser** via [Puter.js](https://puter.com) — no API key, "
+        "no server cost to you. The first message may pop up a quick, free Puter sign-in; "
+        "your trade data itself is only sent to the AI model, never stored by Puter."
+    )
+
+    all_df_ai = db.fetch_trades()
+    cap_df_ai = db.fetch_capital_events()
+    ai_context = utils.build_ai_context(all_df_ai, cap_df_ai)
+
+    if all_df_ai.empty:
+        st.info("No trades logged yet — log some trades first, then come back to ask questions about them.")
+
+    import json as _json
+    context_js = _json.dumps(ai_context)
+    system_prompt_js = _json.dumps(
+        "You are a trading-performance analyst assistant embedded in the user's personal "
+        "trade journal app. Answer questions using ONLY the JOURNAL DATA block below — it "
+        "contains their full performance stats, breakdowns, capital ledger, and raw trade "
+        "log. If something isn't in the data, say so plainly rather than guessing. Be "
+        "concise, use the currency figures and numbers exactly as given, and avoid giving "
+        "financial advice or trade recommendations — stick to describing and analyzing what "
+        "already happened in their data.\n\n=== JOURNAL DATA ===\n" + ai_context
+    )
+
+    chat_html = f"""
+<div id="ai-qa-root" style="font-family: Inter, sans-serif;">
+  <style>
+    #ai-qa-root {{ color: {C['chart_text']}; }}
+    #chatLog {{
+      height: 430px; overflow-y: auto; padding: 14px;
+      background: {C['card']};
+    }}
+    .msg-row {{ display: flex; margin-bottom: 12px; }}
+    .msg-row.user {{ justify-content: flex-end; }}
+    .msg-bubble {{
+      max-width: 78%; padding: 10px 14px; border-radius: 14px;
+      font-size: 14px; line-height: 1.5; white-space: pre-wrap;
+    }}
+    .msg-bubble.user {{ background: {ACCENT}; color: #fff; border-bottom-right-radius: 3px; }}
+    .msg-bubble.assistant {{
+      background: rgba(255,255,255,0.06); border: 1px solid rgba(255,255,255,0.08);
+      color: {C['chart_text']}; border-bottom-left-radius: 3px;
+    }}
+    #chatInputRow {{ display: flex; gap: 8px; padding: 12px; border-top: 1px solid rgba(255,255,255,0.08); }}
+    #chatInput {{
+      flex: 1; resize: none; border-radius: 10px; border: 1px solid rgba(255,255,255,0.15);
+      background: rgba(255,255,255,0.04); color: {C['chart_text']};
+      padding: 9px 12px; font-size: 14px; font-family: inherit; outline: none;
+    }}
+    #chatSendBtn, #chatClearBtn {{
+      border: none; border-radius: 10px; padding: 0 16px; font-weight: 600;
+      font-size: 13.5px; cursor: pointer;
+    }}
+    #chatSendBtn {{ background: {GREEN}; color: #06210f; }}
+    #chatSendBtn:disabled {{ opacity: 0.5; cursor: default; }}
+    #chatClearBtn {{ background: transparent; color: {C['chart_text']}; border: 1px solid rgba(255,255,255,0.15); }}
+    #chatMeta {{ font-size: 11.5px; color: {C['chart_text']}; opacity: 0.55; padding: 0 14px 10px 14px; }}
+    .typing-dot {{ opacity: 0.5; font-style: italic; font-size: 13px; }}
+  </style>
+
+  <div id="chatLog"></div>
+  <div id="chatMeta">Ask things like "what's my win rate on XAUUSD" or "which weekday do I trade worst on?"</div>
+  <div id="chatInputRow">
+    <textarea id="chatInput" rows="1" placeholder="Ask about your trades..."></textarea>
+    <button id="chatSendBtn">Send</button>
+    <button id="chatClearBtn" title="Clear conversation">Clear</button>
+  </div>
+</div>
+
+<script src="https://js.puter.com/v2/"></script>
+<script>
+(function() {{
+  const SYSTEM_PROMPT = {system_prompt_js};
+  let messages = [{{ role: "system", content: SYSTEM_PROMPT }}];
+
+  const log = document.getElementById("chatLog");
+  const input = document.getElementById("chatInput");
+  const sendBtn = document.getElementById("chatSendBtn");
+  const clearBtn = document.getElementById("chatClearBtn");
+
+  function addBubble(role, text) {{
+    const row = document.createElement("div");
+    row.className = "msg-row " + (role === "user" ? "user" : "assistant");
+    const bubble = document.createElement("div");
+    bubble.className = "msg-bubble " + (role === "user" ? "user" : "assistant");
+    bubble.textContent = text;
+    row.appendChild(bubble);
+    log.appendChild(row);
+    log.scrollTop = log.scrollHeight;
+    return bubble;
+  }}
+
+  function extractText(response) {{
+    try {{
+      if (typeof response === "string") return response;
+      if (response && response.message) {{
+        const c = response.message.content;
+        if (typeof c === "string") return c;
+        if (Array.isArray(c)) {{
+          return c.map(b => (b && b.text) ? b.text : "").join("");
+        }}
+      }}
+      if (response && typeof response.text === "string") return response.text;
+      return JSON.stringify(response);
+    }} catch (e) {{
+      return String(response);
+    }}
+  }}
+
+  addBubble("assistant", "Hi! I can see your full trade journal, capital ledger, and stats. Ask me anything about it.");
+
+  async function send() {{
+    const text = input.value.trim();
+    if (!text) return;
+    input.value = "";
+    sendBtn.disabled = true;
+
+    addBubble("user", text);
+    messages.push({{ role: "user", content: text }});
+
+    const assistantBubble = addBubble("assistant", "");
+    assistantBubble.classList.add("typing-dot");
+    assistantBubble.textContent = "Thinking...";
+
+    try {{
+      const response = await puter.ai.chat(messages, {{ stream: true }});
+      let full = "";
+      let first = true;
+      for await (const part of response) {{
+        if (part && part.text) {{
+          if (first) {{
+            assistantBubble.classList.remove("typing-dot");
+            assistantBubble.textContent = "";
+            first = false;
+          }}
+          full += part.text;
+          assistantBubble.textContent = full;
+          log.scrollTop = log.scrollHeight;
+        }}
+      }}
+      if (!full) {{
+        // fallback for non-streaming style responses
+        assistantBubble.classList.remove("typing-dot");
+        full = extractText(response);
+        assistantBubble.textContent = full || "(no response)";
+      }}
+      messages.push({{ role: "assistant", content: full }});
+    }} catch (err) {{
+      assistantBubble.classList.remove("typing-dot");
+      assistantBubble.textContent = "⚠️ Couldn't reach the AI model (" + (err && err.message ? err.message : err) + "). Try again.";
+    }} finally {{
+      sendBtn.disabled = false;
+      input.focus();
+    }}
+  }}
+
+  sendBtn.addEventListener("click", send);
+  input.addEventListener("keydown", function(e) {{
+    if (e.key === "Enter" && !e.shiftKey) {{
+      e.preventDefault();
+      send();
+    }}
+  }});
+  clearBtn.addEventListener("click", function() {{
+    messages = [{{ role: "system", content: SYSTEM_PROMPT }}];
+    log.innerHTML = "";
+    addBubble("assistant", "Conversation cleared. Ask me anything about your journal.");
+  }});
+}})();
+</script>
+"""
+    components.html(chat_html, height=560, scrolling=True)
+
+    with st.expander("What data does the AI see?"):
+        st.code(ai_context, language="text")
 
 # ---------------------------------------------------------------------------
 # PAGE: Settings
