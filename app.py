@@ -9,6 +9,7 @@ Run with:  streamlit run app.py
 import calendar as cal_module
 import time
 from datetime import datetime, date, time as dtime
+import json
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -54,7 +55,6 @@ THEMES = {
         "green": "#22C55E", "red": "#EF4444", "accent": "#3B82F6",
         "chart_text": "#C9D2DA", "grid": "#1D242C",
         "fill_green": "rgba(34,197,94,0.08)",
-        # --- FIX: added missing card and other common keys ---
         "card": "#141B22",
         "bg": "#0A0D12",
         "text": "#E6EDF3",
@@ -89,7 +89,6 @@ THEMES = {
         "green": "#16A34A", "red": "#DC2626", "accent": "#2563EB",
         "chart_text": "#334155", "grid": "#E2E8F0",
         "fill_green": "rgba(22,163,74,0.10)",
-        # --- FIX: added missing card and other common keys ---
         "card": "#FFFFFF",
         "bg": "#F4F6F9",
         "text": "#0F172A",
@@ -127,12 +126,6 @@ GREEN, RED, ACCENT = C["green"], C["red"], C["accent"]
 
 # ---------------------------------------------------------------------------
 # Global CSS — structural styles only; all colors come from the theme vars.
-# JITTER FIXES:
-#   • entrance animations are opacity-only + short (no layout shift on reruns)
-#   • whole-page pageIn animation removed
-#   • hover lift effects gated behind (hover:hover) so touch devices never stick
-#   • animated elements get GPU hints (translateZ / backface-visibility)
-#   • transitions restricted to transform / opacity / color / shadow
 # ---------------------------------------------------------------------------
 BASE_CSS = """
 <style>
@@ -1435,8 +1428,6 @@ elif page == "🔍 Analytics":
                     green_periods = int((bdf["net_pnl"] > 0).sum())
 
                     # ---- capital-ledger based % return (Modified Dietz) ----
-                    # Uses your logged deposits/withdrawals so a big top-up doesn't
-                    # masquerade as a trading gain when comparing % return to gold.
                     window_start = bdf["period"].iloc[0].start_time
                     window_end = bdf["period"].iloc[-1].end_time
                     cap_df_all = db.fetch_capital_events()
@@ -1564,14 +1555,26 @@ elif page == "🔍 Analytics":
 # PAGE: AI Q&A (Puter.js — free, keyless AI chat in the browser)
 # ---------------------------------------------------------------------------
 elif page == "🤖 AI Q&A":
-    st.markdown(
-        "Ask questions about your whole trading journal — performance, per-instrument "
-        "breakdowns, streaks, capital history, anything in your data. This runs "
-        "**entirely in your browser** via [Puter.js](https://puter.com) — no API key, "
-        "no server cost to you. The first message may pop up a quick, free Puter sign-in; "
-        "your trade data itself is only sent to the AI model, never stored by Puter."
-    )
+    st.header("🤖 Ask the AI about your journal (free, no API keys)")
+    st.caption("Powered by Puter.js — 500+ AI models, completely free for users.")
+    
+    # Model selection
+    model_options = {
+        "GPT-5.4 Nano (Fast)": "openai/gpt-5.4-nano",
+        "GPT-5.1": "openai/gpt-5.1",
+        "Claude 4.6 Sonnet": "claude-sonnet-4-6",
+        "Claude Sonnet 5": "anthropic/claude-sonnet-5",
+        "Gemini 3.1 Pro": "google/gemini-3.1-pro-preview",
+        "Gemini 3.8 Flash": "google/gemini-3.8-flash",
+        "DeepSeek-V4": "deepseek/deepseek-v4",
+        "Llama 4 Maverick": "openrouter:meta-llama/llama-4-maverick",
+        "Grok 4.5": "x-ai/grok-4.5",
+        "Mistral Medium 3.5": "mistral/mistral-medium-3.5",
+    }
+    selected_model_name = st.selectbox("Select AI Model", list(model_options.keys()))
+    model_id = model_options[selected_model_name]
 
+    # Build context from trade journal data
     all_df_ai = db.fetch_trades()
     cap_df_ai = db.fetch_capital_events()
     ai_context = utils.build_ai_context(all_df_ai, cap_df_ai)
@@ -1579,169 +1582,69 @@ elif page == "🤖 AI Q&A":
     if all_df_ai.empty:
         st.info("No trades logged yet — log some trades first, then come back to ask questions about them.")
 
-    import json as _json
-    context_js = _json.dumps(ai_context)
-    system_prompt_js = _json.dumps(
-        "You are a trading-performance analyst assistant embedded in the user's personal "
-        "trade journal app. Answer questions using ONLY the JOURNAL DATA block below — it "
-        "contains their full performance stats, breakdowns, capital ledger, and raw trade "
-        "log. If something isn't in the data, say so plainly rather than guessing. Be "
-        "concise, use the currency figures and numbers exactly as given, and avoid giving "
-        "financial advice or trade recommendations — stick to describing and analyzing what "
-        "already happened in their data.\n\n=== JOURNAL DATA ===\n" + ai_context
+    user_question = st.text_area(
+        "Your question",
+        height=100,
+        placeholder="e.g., What is my win rate on XAUUSD? Which weekday do I trade worst on? Show me my drawdown."
     )
 
-    chat_html = f"""
-<div id="ai-qa-root" style="font-family: Inter, sans-serif;">
-  <style>
-    #ai-qa-root {{ color: {C['chart_text']}; }}
-    #chatLog {{
-      height: 430px; overflow-y: auto; padding: 14px;
-      background: {C['card']};
-    }}
-    .msg-row {{ display: flex; margin-bottom: 12px; }}
-    .msg-row.user {{ justify-content: flex-end; }}
-    .msg-bubble {{
-      max-width: 78%; padding: 10px 14px; border-radius: 14px;
-      font-size: 14px; line-height: 1.5; white-space: pre-wrap;
-    }}
-    .msg-bubble.user {{ background: {ACCENT}; color: #fff; border-bottom-right-radius: 3px; }}
-    .msg-bubble.assistant {{
-      background: rgba(255,255,255,0.06); border: 1px solid rgba(255,255,255,0.08);
-      color: {C['chart_text']}; border-bottom-left-radius: 3px;
-    }}
-    #chatInputRow {{ display: flex; gap: 8px; padding: 12px; border-top: 1px solid rgba(255,255,255,0.08); }}
-    #chatInput {{
-      flex: 1; resize: none; border-radius: 10px; border: 1px solid rgba(255,255,255,0.15);
-      background: rgba(255,255,255,0.04); color: {C['chart_text']};
-      padding: 9px 12px; font-size: 14px; font-family: inherit; outline: none;
-    }}
-    #chatSendBtn, #chatClearBtn {{
-      border: none; border-radius: 10px; padding: 0 16px; font-weight: 600;
-      font-size: 13.5px; cursor: pointer;
-    }}
-    #chatSendBtn {{ background: {GREEN}; color: #06210f; }}
-    #chatSendBtn:disabled {{ opacity: 0.5; cursor: default; }}
-    #chatClearBtn {{ background: transparent; color: {C['chart_text']}; border: 1px solid rgba(255,255,255,0.15); }}
-    #chatMeta {{ font-size: 11.5px; color: {C['chart_text']}; opacity: 0.55; padding: 0 14px 10px 14px; }}
-    .typing-dot {{ opacity: 0.5; font-style: italic; font-size: 13px; }}
-  </style>
+    if st.button("Ask AI") and user_question:
+        # Build the combined prompt (like the gold macro does)
+        full_prompt = (
+            "You are a trading-performance analyst assistant embedded in the user's personal trade journal app. "
+            "Answer questions using ONLY the JOURNAL DATA block below — it contains their full performance stats, "
+            "breakdowns, capital ledger, and raw trade log. If something isn't in the data, say so plainly rather than "
+            "guessing. Be concise, use the currency figures and numbers exactly as given, and avoid giving financial "
+            "advice or trade recommendations — stick to describing and analyzing what already happened in their data.\n\n"
+            f"=== JOURNAL DATA ===\n{ai_context}\n\n"
+            f"USER QUESTION:\n{user_question}\n\n"
+            "ANSWER:"
+        )
 
-  <div id="chatLog"></div>
-  <div id="chatMeta">Ask things like "what's my win rate on XAUUSD" or "which weekday do I trade worst on?"</div>
-  <div id="chatInputRow">
-    <textarea id="chatInput" rows="1" placeholder="Ask about your trades..."></textarea>
-    <button id="chatSendBtn">Send</button>
-    <button id="chatClearBtn" title="Clear conversation">Clear</button>
-  </div>
-</div>
+        # HTML component – exactly as in gold macro
+        html_code = f"""
+        <div style="background: #0e1117; padding: 15px; border-radius: 10px; border: 1px solid #30363d;">
+            <div style="color: #8b949e; font-size: 14px; margin-bottom: 8px;">🤖 AI is thinking...</div>
+            <div id="puter-response" style="color: #f0f6fc; font-size: 16px; line-height: 1.6; white-space: pre-wrap; min-height: 50px;">
+                ⏳ Loading...
+            </div>
+        </div>
+        
+        <script src="https://js.puter.com/v2/"></script>
+        <script>
+            (function() {{
+                const responseDiv = document.getElementById('puter-response');
+                const fullPrompt = {json.dumps(full_prompt)};
+                const model = {json.dumps(model_id)};
+                
+                puter.ai.chat(fullPrompt, {{ 
+                    model: model,
+                    stream: true 
+                }}).then(async (response) => {{
+                    let fullText = '';
+                    responseDiv.innerHTML = '';
+                    
+                    for await (const part of response) {{
+                        if (part?.text) {{
+                            fullText += part.text;
+                            responseDiv.innerHTML = fullText;
+                        }}
+                    }}
+                    
+                    if (!fullText) {{
+                        responseDiv.innerHTML = '⚠️ No response received. Please try again.';
+                    }}
+                }}).catch((error) => {{
+                    responseDiv.innerHTML = '❌ Error: ' + error.message + '. Please try again.';
+                }});
+            }})();
+        </script>
+        """
+        st.components.v1.html(html_code, height=300, scrolling=True)
 
-<script src="https://js.puter.com/v2/"></script>
-<script>
-(function() {{
-  const SYSTEM_PROMPT = {system_prompt_js};
-  let messages = [{{ role: "system", content: SYSTEM_PROMPT }}];
-
-  const log = document.getElementById("chatLog");
-  const input = document.getElementById("chatInput");
-  const sendBtn = document.getElementById("chatSendBtn");
-  const clearBtn = document.getElementById("chatClearBtn");
-
-  function addBubble(role, text) {{
-    const row = document.createElement("div");
-    row.className = "msg-row " + (role === "user" ? "user" : "assistant");
-    const bubble = document.createElement("div");
-    bubble.className = "msg-bubble " + (role === "user" ? "user" : "assistant");
-    bubble.textContent = text;
-    row.appendChild(bubble);
-    log.appendChild(row);
-    log.scrollTop = log.scrollHeight;
-    return bubble;
-  }}
-
-  function extractText(response) {{
-    try {{
-      if (typeof response === "string") return response;
-      if (response && response.message) {{
-        const c = response.message.content;
-        if (typeof c === "string") return c;
-        if (Array.isArray(c)) {{
-          return c.map(b => (b && b.text) ? b.text : "").join("");
-        }}
-      }}
-      if (response && typeof response.text === "string") return response.text;
-      return JSON.stringify(response);
-    }} catch (e) {{
-      return String(response);
-    }}
-  }}
-
-  addBubble("assistant", "Hi! I can see your full trade journal, capital ledger, and stats. Ask me anything about it.");
-
-  async function send() {{
-    const text = input.value.trim();
-    if (!text) return;
-    input.value = "";
-    sendBtn.disabled = true;
-
-    addBubble("user", text);
-    messages.push({{ role: "user", content: text }});
-
-    const assistantBubble = addBubble("assistant", "");
-    assistantBubble.classList.add("typing-dot");
-    assistantBubble.textContent = "Thinking...";
-
-    try {{
-      const response = await puter.ai.chat(messages, {{ stream: true }});
-      let full = "";
-      let first = true;
-      for await (const part of response) {{
-        if (part && part.text) {{
-          if (first) {{
-            assistantBubble.classList.remove("typing-dot");
-            assistantBubble.textContent = "";
-            first = false;
-          }}
-          full += part.text;
-          assistantBubble.textContent = full;
-          log.scrollTop = log.scrollHeight;
-        }}
-      }}
-      if (!full) {{
-        // fallback for non-streaming style responses
-        assistantBubble.classList.remove("typing-dot");
-        full = extractText(response);
-        assistantBubble.textContent = full || "(no response)";
-      }}
-      messages.push({{ role: "assistant", content: full }});
-    }} catch (err) {{
-      assistantBubble.classList.remove("typing-dot");
-      assistantBubble.textContent = "⚠️ Couldn't reach the AI model (" + (err && err.message ? err.message : err) + "). Try again.";
-    }} finally {{
-      sendBtn.disabled = false;
-      input.focus();
-    }}
-  }}
-
-  sendBtn.addEventListener("click", send);
-  input.addEventListener("keydown", function(e) {{
-    if (e.key === "Enter" && !e.shiftKey) {{
-      e.preventDefault();
-      send();
-    }}
-  }});
-  clearBtn.addEventListener("click", function() {{
-    messages = [{{ role: "system", content: SYSTEM_PROMPT }}];
-    log.innerHTML = "";
-    addBubble("assistant", "Conversation cleared. Ask me anything about your journal.");
-  }});
-}})();
-</script>
-"""
-    components.html(chat_html, height=560, scrolling=True)
-
-    with st.expander("What data does the AI see?"):
-        st.code(ai_context, language="text")
+        # Show the context for transparency
+        with st.expander("📊 Context provided to AI"):
+            st.code(ai_context, language="text")
 
 # ---------------------------------------------------------------------------
 # PAGE: Settings
